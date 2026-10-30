@@ -1,4 +1,5 @@
-# tracer.py uses only the Python standard library (3.10+); nothing to pip install.
+# tracer.py and tracer_tui.py use only the Python standard library (3.10+, incl. curses);
+# nothing to pip install.
 # Optional, only for `-o something.png` rendering:
 #   - Chrome/Chromium on PATH (system package, not pip)
 #   - vendor/mermaid.min.js (mermaid 11.4.1, vendored from cdn.jsdelivr.net/npm/mermaid@11.4.1)

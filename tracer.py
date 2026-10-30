@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tracer: print the chain of functions called from a given Python function.
 
-usage: tracer.py FILE FUNCTION | FILE:FUNCTION [--root DIR] [--depth N] [--external]
+usage: tracer.py FILE FUNCTION | FILE:FUNCTION [-i] [--root DIR] [--depth N] [--external]
                  [--all-calls] [--format tree|json|mermaid|dot]
 
 FUNCTION is `name` or `Class.method`. Calls are resolved statically (ast) to
@@ -416,6 +416,8 @@ def main() -> int:
     ap.add_argument("--format", choices=["tree", "json", "mermaid", "dot"], default="tree")
     ap.add_argument("-o", "--output", type=Path,
                     help="write to file instead of stdout; a .png path renders the Mermaid graph (needs Chrome)")
+    ap.add_argument("-i", "--interactive", action="store_true",
+                    help="open the colourful interactive explorer (curses)")
     ap.add_argument("--json", action="store_true", help="alias for --format json")
     a = ap.parse_args()
     if a.function is None:
@@ -448,6 +450,9 @@ def main() -> int:
         print(f"error: {a.function!r} not found (or ambiguous) in {a.file}\navailable: {', '.join(avail)}",
               file=sys.stderr)
         return 1
+    if a.interactive:
+        from tracer_tui import run
+        return run(Tracer(proj, None, True), fn, a.external)
     tree = Tracer(proj, a.depth, a.external, a.all_calls).build(fn)
     if a.format == "json":
         text = json.dumps(tree, indent=2)
