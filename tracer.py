@@ -14,12 +14,26 @@ import argparse
 import ast
 import html
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+
+
+# never resolve imports into (or scan) installed packages / virtualenvs
+SKIP_DIRS = {"site-packages", "dist-packages", ".venv", "venv", ".tox", ".git", "__pycache__",
+             "node_modules", ".eggs"}
+
+
+@dataclass
+class Call:
+    line: int
+    label: str
+    target: "FuncInfo | None"
+    override: bool = False      # a subclass override of the statically resolved method
 
 
 @dataclass
@@ -39,13 +53,75 @@ class Module:
     classes: dict[str, dict[str, FuncInfo]] = field(default_factory=dict)
     bases: dict[str, list[ast.expr]] = field(default_factory=dict)
     imports: dict[str, tuple[str, str | None]] = field(default_factory=dict)  # alias -> (module, symbol|None)
-    attr_types: dict[str, dict[str, ast.expr]] = field(default_factory=dict)  # class -> self.attr -> ctor expr
+    # class -> self.attr -> (type expr, exact): exact=True when it came from `self.x = Cls()`
+    attr_types: dict[str, dict[str, tuple[ast.expr, bool]]] = field(default_factory=dict)
 
 
 class Project:
     def __init__(self, root: Path):
         self.root = root.resolve()
         self.modules: dict[str, Module] = {}
+        self._all_loaded = False
+        self._subs: dict[tuple[str, str], list[tuple[Module, str]]] | None = None
+
+    def is_third_party(self, path: Path) -> bool:
+        try:
+            parts = path.resolve().relative_to(self.root).parts
+        except ValueError:
+            return True
+        return any(p in SKIP_DIRS for p in parts)
+
+    def all_modules(self, limit: int = 5000) -> list[Module]:
+        """Every project .py file (third-party dirs skipped), loaded once."""
+        if not self._all_loaded:
+            self._all_loaded = True
+            n = 0
+            for dp, dns, fns in os.walk(self.root):
+                dns[:] = [d for d in dns if d not in SKIP_DIRS]
+                for f in fns:
+                    if f.endswith(".py") and n < limit:
+                        n += 1
+                        self.load_path(Path(dp, f))
+        return list(self.modules.values())
+
+    def subclass_map(self) -> dict[tuple[str, str], list[tuple[Module, str]]]:
+        if self._subs is None:
+            self._subs = {}
+            for m in self.all_modules():
+                for cname, bases in m.bases.items():
+                    for b in bases:
+                        bn = dotted(b)
+                        r = self.class_of(m, bn) if bn else None
+                        if r:
+                            self._subs.setdefault((r[0].name, r[1]), []).append((m, cname))
+        return self._subs
+
+    def overriders(self, mod: Module, cls: str, meth: str) -> list[FuncInfo]:
+        """Methods named `meth` defined by (transitive) subclasses of mod.cls."""
+        subs, out, seen, stack = self.subclass_map(), [], set(), [(mod.name, cls)]
+        while stack:
+            for m, c in subs.get(stack.pop(), []):
+                if (m.name, c) in seen:
+                    continue
+                seen.add((m.name, c))
+                stack.append((m.name, c))
+                if f := m.classes.get(c, {}).get(meth):
+                    out.append(f)
+        return sorted(out, key=lambda f: f.qname)
+
+    def attr_type(self, mod: Module, cls: str, attr: str, _seen=None):
+        """(defining module, type expr, exact) for self.attr, searching base classes too."""
+        _seen = _seen if _seen is not None else set()
+        if (mod.name, cls) in _seen:
+            return None
+        _seen.add((mod.name, cls))
+        if (hit := mod.attr_types.get(cls, {}).get(attr)) is not None:
+            return mod, hit[0], hit[1]
+        for b in mod.bases.get(cls, []):
+            r = self.class_of(mod, dotted(b) or "")
+            if r and (found := self.attr_type(r[0], r[1], attr, _seen)):
+                return found
+        return None
 
     def module_name(self, path: Path) -> str:
         rel = path.resolve().relative_to(self.root).with_suffix("")
@@ -61,7 +137,7 @@ class Project:
             return None
         base = self.root.joinpath(*name.split("."))
         for cand in (base.with_suffix(".py"), base / "__init__.py"):
-            if cand.is_file():
+            if cand.is_file() and not self.is_third_party(cand):
                 return self.load_path(cand)
         return None
 
@@ -110,18 +186,31 @@ class Project:
                     mod.imports[a.asname or a.name] = (target, a.name)
 
     @staticmethod
-    def _self_attrs(cls: ast.ClassDef) -> dict[str, ast.expr]:
-        out: dict[str, ast.expr] = {}
-        for n in ast.walk(cls):
-            if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call):
-                for t in n.targets:
-                    if (isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name)
-                            and t.value.id == "self"):
-                        out[t.attr] = n.value.func
-            elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Attribute):
-                t = n.target
-                if isinstance(t.value, ast.Name) and t.value.id == "self":
-                    out[t.attr] = n.annotation
+    def _self_attrs(cls: ast.ClassDef) -> dict[str, tuple[ast.expr, bool]]:
+        """self.attr -> (type expr, exact). Sources: `self.x = Cls()` (exact), `self.x: T = ..`,
+        and `self.x = param` where `param: T` is annotated (declared type, may be a subclass)."""
+        out: dict[str, tuple[ast.expr, bool]] = {}
+        declared: set[str] = set()
+        is_self = lambda t: (isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name)
+                             and t.value.id == "self")
+        for item in cls.body:
+            if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            ann = {a.arg: a.annotation for a in (*item.args.posonlyargs, *item.args.args,
+                                                 *item.args.kwonlyargs) if a.annotation}
+            for n in ast.walk(item):
+                if isinstance(n, ast.Assign):
+                    for t in n.targets:
+                        if not is_self(t) or t.attr in declared:
+                            continue
+                        if isinstance(n.value, ast.Call):
+                            out[t.attr] = (n.value.func, True)
+                        elif isinstance(n.value, ast.Name) and n.value.id in ann:
+                            out[t.attr] = (ann[n.value.id], False)
+                            declared.add(t.attr)
+                elif isinstance(n, ast.AnnAssign) and is_self(n.target):
+                    out[n.target.attr] = (n.annotation, False)
+                    declared.add(n.target.attr)
         return out
 
     # ---- symbol resolution -------------------------------------------------
@@ -187,8 +276,14 @@ def dotted(node: ast.AST) -> str | None:
     if isinstance(node, ast.Attribute):
         base = dotted(node.value)
         return f"{base}.{node.attr}" if base else None
-    if isinstance(node, ast.Subscript):          # Optional[Foo] / list[Foo] -> Foo
-        return dotted(node.slice)
+    if isinstance(node, ast.Subscript):          # Optional[Foo] -> Foo (list[Foo] etc. are not Foo)
+        base = dotted(node.value) or ""
+        return dotted(node.slice) if base.split(".")[-1] == "Optional" else None
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):      # Foo | None
+        for side in (node.left, node.right):
+            if not (isinstance(side, ast.Constant) and side.value is None) and (d := dotted(side)):
+                return d
+        return None
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
     return None
@@ -201,27 +296,28 @@ class Tracer:
         self.max_depth = max_depth
         self.external = external
 
-    def local_types(self, fn: FuncInfo) -> dict[str, str]:
-        """var name -> dotted class expression, from `x = Cls()` and annotations."""
-        types: dict[str, str] = {}
+    def local_types(self, fn: FuncInfo) -> dict[str, tuple[str, bool]]:
+        """var -> (dotted class expr, exact) from `x = Cls()` (exact) and annotations (declared)."""
+        types: dict[str, tuple[str, bool]] = {}
         node = fn.node
         for a in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs):
             if a.annotation and (d := dotted(a.annotation)):
-                types[a.arg] = d
+                types[a.arg] = (d, False)
         for n in ast.walk(node):
             if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call):
                 d = dotted(n.value.func)
                 if d:
                     for t in n.targets:
-                        if isinstance(t, ast.Name):
-                            types[t.id] = d
+                        if isinstance(t, ast.Name) and t.id not in types:
+                            types[t.id] = (d, True)
             elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name):
                 if d := dotted(n.annotation):
-                    types[n.target.id] = d
+                    types[n.target.id] = (d, False)
         return types
 
-    def calls(self, fn: FuncInfo) -> list[tuple[int, str, FuncInfo | None]]:
-        """Source-ordered, de-duplicated (line, label, resolved target) for calls in fn."""
+    def calls(self, fn: FuncInfo) -> list[Call]:
+        """Source-ordered, de-duplicated calls in fn. Method calls whose receiver type is only
+        *declared* (self, annotations) also yield the subclass overrides as `override=True`."""
         types = self.local_types(fn)
         found = [n for n in ast.walk(fn.node) if isinstance(n, ast.Call)]
         found.sort(key=lambda c: (c.lineno, c.col_offset))
@@ -233,46 +329,58 @@ class Tracer:
                     label = f"….{c.func.attr}"      # e.g. foo().bar()
                 else:
                     continue
-            target = self.resolve_call(fn, c.func, types)
+            target, recv = self.resolve_call(fn, c.func, types)
             key = target.qname if target else label
             if key in seen and not self.all_calls:
                 continue
             seen.add(key)
-            out.append((c.lineno, label, target))
+            out.append(Call(c.lineno, label, target))
+            if recv is not None and isinstance(c.func, ast.Attribute):
+                for f in self.p.overriders(recv[0], recv[1], c.func.attr):
+                    if f.qname not in seen or self.all_calls:
+                        seen.add(f.qname)
+                        out.append(Call(c.lineno, label, f, override=True))
         return out
 
-    def resolve_call(self, fn: FuncInfo, func: ast.expr, types: dict[str, str]) -> FuncInfo | None:
+    def resolve_call(self, fn: FuncInfo, func: ast.expr, types: dict[str, tuple[str, bool]]):
+        """-> (target FuncInfo | None, receiver class (Module, name) | None).
+        The receiver is returned only when its type is declared rather than exact, i.e.
+        when a subclass override might be what actually runs."""
         mod = fn.module
+        none = (None, None)
         if isinstance(func, ast.Name):
-            return self._by_symbol(mod, func.id)
+            return self._by_symbol(mod, func.id), None
         if not isinstance(func, ast.Attribute):
-            return None
+            return none
         meth, recv = func.attr, func.value
         # self.method() / cls.method()
         if isinstance(recv, ast.Name) and recv.id in ("self", "cls") and fn.cls:
-            return self.p.find_method(mod, fn.cls, meth)
+            return self.p.find_method(mod, fn.cls, meth), (mod, fn.cls)
         # super().method()
         if (isinstance(recv, ast.Call) and isinstance(recv.func, ast.Name)
                 and recv.func.id == "super" and fn.cls):
             for b in mod.bases.get(fn.cls, []):
                 r = self.p.class_of(mod, dotted(b) or "")
                 if r and (m := self.p.find_method(r[0], r[1], meth)):
-                    return m
-            return None
-        # self.attr.method()
+                    return m, None
+            return none
+        # self.attr.method()   (attr type may come from a base class's __init__ annotation)
         if (isinstance(recv, ast.Attribute) and isinstance(recv.value, ast.Name)
                 and recv.value.id == "self" and fn.cls):
-            ctor = mod.attr_types.get(fn.cls, {}).get(recv.attr)
-            if ctor is not None and (d := dotted(ctor)):
-                return self._method_on(mod, d, meth)
-            return None
+            at = self.p.attr_type(mod, fn.cls, recv.attr)
+            if at and (d := dotted(at[1])):
+                return self._method_on(at[0], d, meth, exact=at[2])
+            return none
         if isinstance(recv, ast.Name):
             m = self.p.resolve_module(mod, recv.id)          # imported module: mod.func()
             if m:
-                return self._by_symbol(m, meth)
-            if recv.id in types and (r := self._method_on(mod, types[recv.id], meth)):
-                return r                                      # typed variable
-            return self._method_on(mod, recv.id, meth)        # Class.method()
+                return self._by_symbol(m, meth), None
+            if recv.id in types:                              # typed variable
+                d, exact = types[recv.id]
+                t, r = self._method_on(mod, d, meth, exact=exact)
+                if t or r:
+                    return t, r
+            return self._method_on(mod, recv.id, meth, exact=True)   # Class.method()
         d = dotted(recv)                                      # pkg.sub.func()
         if d:
             head, _, rest = d.partition(".")
@@ -280,12 +388,14 @@ class Tracer:
             if m:
                 m2 = self.p.load(f"{m.name}.{rest}") if rest else m
                 if m2:
-                    return self._by_symbol(m2, meth)
-        return None
+                    return self._by_symbol(m2, meth), None
+        return none
 
-    def _method_on(self, mod: Module, class_expr: str, meth: str) -> FuncInfo | None:
+    def _method_on(self, mod: Module, class_expr: str, meth: str, exact: bool):
         r = self.p.class_of(mod, class_expr)
-        return self.p.find_method(r[0], r[1], meth) if r else None
+        if not r:
+            return None, None
+        return self.p.find_method(r[0], r[1], meth), (None if exact else r)
 
     def _by_symbol(self, mod: Module, name: str) -> FuncInfo | None:
         r = self.p.resolve_symbol(mod, name)
@@ -307,13 +417,13 @@ class Tracer:
         if self.max_depth is not None and depth >= self.max_depth:
             node["status"] = "depth-limit"
             return node
-        for line, label, target in self.calls(fn):
-            if target is not None:
-                child = self.build(target, depth + 1, (*stack, fn.qname))
-                child["call_line"], child["label"] = line, label
+        for c in self.calls(fn):
+            if c.target is not None:
+                child = self.build(c.target, depth + 1, (*stack, fn.qname))
+                child["call_line"], child["label"], child["override"] = c.line, c.label, c.override
                 node["calls"].append(child)
             elif self.external:
-                node["calls"].append({"name": label, "call_line": line, "label": label,
+                node["calls"].append({"name": c.label, "call_line": c.line, "label": c.label,
                                       "external": True, "calls": [], "status": None})
         return node
 
@@ -330,6 +440,8 @@ def render(node: dict, prefix: str = "", last: bool = True, top: bool = True) ->
         else:
             line = f"{node['name']}  :{node['call_line']}"
     note = {"recursive": "  ↻ recursive", "depth-limit": "  … depth limit"}.get(node["status"], "")
+    if node.get("override"):
+        note = "  ◇ override" + note
     out = [prefix + branch + line + note]
     kids = node["calls"]
     for i, k in enumerate(kids):
@@ -346,8 +458,8 @@ def _walk(node: dict, ids: dict, edges: list, nodes: dict) -> str:
     me = ids[key]
     for k in node["calls"]:
         child = _walk(k, ids, edges, nodes)
-        if (me, child) not in edges:
-            edges.append((me, child))
+        if not any(e[:2] == (me, child) for e in edges):
+            edges.append((me, child, bool(k.get("override"))))
     return me
 
 
@@ -360,11 +472,11 @@ def render_graph(tree: dict, fmt: str) -> str:
         mm = lambda n: esc(n).replace("_", "\\_").replace(":", "<br/>", 1)
         out = ["graph LR"]
         out += [f'    {i}["{mm(n)}"]' for i, n in nodes.items()]
-        out += [f"    {a} --> {b}" for a, b in edges]
+        out += [f"    {a} {'-.->' if dashed else '-->'} {b}" for a, b, dashed in edges]
     else:
         out = ["digraph trace {", "    rankdir=LR;", "    node [shape=box, fontname=monospace];"]
         out += [f'    {i} [label="{esc(n)}"];' for i, n in nodes.items()]
-        out += [f"    {a} -> {b};" for a, b in edges]
+        out += [f"    {a} -> {b}{' [style=dashed]' if dashed else ''};" for a, b, dashed in edges]
         out.append("}")
     return "\n".join(out)
 

@@ -161,9 +161,10 @@ class Highlighter:
 # ── lazy call tree ──────────────────────────────────────────────────────────────
 
 class Node:
-    def __init__(self, fn, parent=None, call_line=None, label=None, external=False, recursive=False):
+    def __init__(self, fn, parent=None, call_line=None, label=None, external=False,
+                 recursive=False, override=False):
         self.fn, self.parent, self.call_line, self.label = fn, parent, call_line, label
-        self.external, self.recursive = external, recursive
+        self.external, self.recursive, self.override = external, recursive, override
         self.expanded = False
         self.kids: list[Node] | None = None
 
@@ -204,11 +205,12 @@ class CallTree:
             n.kids = []
             if n.fn is not None and not n.recursive:
                 seen = n.ancestors_q()
-                for line, label, target in self.calls_of(n.fn):
-                    if target is None:
-                        n.kids.append(Node(None, n, line, label, external=True))
+                for c in self.calls_of(n.fn):
+                    if c.target is None:
+                        n.kids.append(Node(None, n, c.line, c.label, external=True))
                     else:
-                        n.kids.append(Node(target, n, line, label, recursive=target.qname in seen))
+                        n.kids.append(Node(c.target, n, c.line, c.label,
+                                           recursive=c.target.qname in seen, override=c.override))
         return n.kids
 
     def visible_kids(self, n: Node) -> list[Node]:
@@ -374,9 +376,10 @@ class App:
         if self.focus == "code":
             tg = self.callees_on_line(self.cursor_lineno())
             if tg:
-                return f"line {self.cursor_lineno()}: calls → " + ", ".join(c.name for c in tg)
+                return f"line {self.cursor_lineno()}: calls → " + ", ".join(
+                c.name + (" (override)" if c.override else "") for c in tg)
             return f"line {self.cursor_lineno()}"
-        extra = "  ↻ recursive" if n.recursive else ""
+        extra = "  ↻ recursive" if n.recursive else ("  ◇ subclass override of the called method" if n.override else "")
         return f"{n.module}  {n.fn.module.path}:{n.fn.node.lineno}  ({len(self.tree.visible_kids(n))} calls){extra}"
 
     def draw_tree(self, y: int, x: int, h: int, w: int) -> None:
@@ -407,6 +410,8 @@ class App:
                 glyph, gst = "·", "dim"
             elif n.recursive:
                 glyph, gst = "↻", "err"
+            elif n.override and not self.tree.visible_kids(n):
+                glyph, gst = "◇", "warn"
             elif self.tree.visible_kids(n):
                 glyph, gst = ("▾" if n.expanded else "▸"), "accent"
             else:
@@ -430,6 +435,8 @@ class App:
             if n.call_line is not None:
                 self.put(yy, col, f" :{n.call_line}", th.attr("line", bg), x + w - 1 - col)
                 col += len(str(n.call_line)) + 2
+            if n.override:
+                self.put(yy, col, " ◇ override", th.attr("warn", bg), x + w - 1 - col)
         if len(rows) > inner:                           # scrollbar
             bar_h = max(1, inner * inner // len(rows))
             bar_y = (inner - bar_h) * self.tree_top // max(1, len(rows) - inner)
@@ -533,7 +540,8 @@ class App:
         if not tg:
             self.msg = "no project function is called on this line"
             return
-        pick = tg[0] if len(tg) == 1 else self.choose("Jump to which call?", [k.name for k in tg], tg)
+        pick = tg[0] if len(tg) == 1 else self.choose(
+            "Jump to which call?", [k.name + ("   ◇ override" if k.override else "") for k in tg], tg)
         if pick is not None:
             self.sel.expanded = True
             self.select(pick)
