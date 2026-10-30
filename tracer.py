@@ -31,6 +31,10 @@ SKIP_DIRS = {"site-packages", "dist-packages", ".venv", "venv", ".tox", ".git", 
              "node_modules", ".eggs"}
 
 
+if __name__ == "__main__":
+    sys.modules.setdefault("tracer", sys.modules[__name__])
+
+
 @dataclass
 class Call:
     line: int
@@ -48,6 +52,11 @@ class FuncInfo:
     node: ast.AST
     cls: str | None = None
 
+    @property
+    def lib(self) -> str | None:
+        """Origin label ("site-packages", "stdlib", ...) if this lives outside the project."""
+        return self.module.lib
+
 
 @dataclass
 class Module:
@@ -61,11 +70,14 @@ class Module:
     # class -> self.attr -> (type expr, exact): exact=True when it came from `self.x = Cls()`
     attr_types: dict[str, dict[str, tuple[ast.expr, bool]]] = field(default_factory=dict)
     star: list[str] = field(default_factory=list)             # modules pulled in by `from x import *`
+    lib: str | None = None                                    # origin label for library modules
 
 
 class Project:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, lib: str | None = None):
         self.root = root.resolve()
+        self.lib = lib                  # set for projects that wrap an installed-package directory
+        self.libs: list["Project"] = []     # library projects consulted when a module isn't ours
         self.modules: dict[str, Module] = {}
         self._all_loaded = False
         self._subs: dict[tuple[str, str], list[tuple[Module, str]]] | None = None
@@ -136,7 +148,7 @@ class Project:
             parts.pop()
         return ".".join(parts)
 
-    def load(self, name: str) -> Module | None:
+    def load(self, name: str, own_only: bool = False) -> Module | None:
         if name in self.modules:
             return self.modules[name]
         if not name:
@@ -145,6 +157,10 @@ class Project:
         for cand in (base.with_suffix(".py"), base / "__init__.py"):
             if cand.is_file() and not self.is_third_party(cand):
                 return self.load_path(cand)
+        if not own_only:
+            for lp in self.libs:            # library fallback, in priority order
+                if m := lp.load(name, own_only=True):
+                    return m
         return None
 
     def load_path(self, path: Path) -> Module | None:
@@ -155,7 +171,7 @@ class Project:
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         except (SyntaxError, UnicodeDecodeError, OSError):
             return None
-        mod = Module(name, path, tree)
+        mod = Module(name, path, tree, lib=self.lib)
         self.modules[name] = mod
         self._index(mod)
         return mod
@@ -304,8 +320,10 @@ def dotted(node: ast.AST) -> str | None:
 
 
 class Tracer:
-    def __init__(self, project: Project, max_depth: int | None, external: bool, all_calls: bool = False):
+    def __init__(self, project: Project, max_depth: int | None, external: bool, all_calls: bool = False,
+                 lib_depth: int = 2):
         self.p = project
+        self.lib_depth = lib_depth          # how many levels deep to follow once inside library code
         self.all_calls = all_calls
         self.max_depth = max_depth
         self.external = external
@@ -426,7 +444,7 @@ class Tracer:
             path = f"builtins.{head}"
         else:
             return None
-        return None if self.p.load(path.split(".")[0]) else path
+        return None if self.p.load(path.split(".")[0], own_only=True) else path
 
     def external_path(self, fn: FuncInfo, func: ast.expr, types, ctx=None) -> str | None:
         """Best static guess of where an unresolved call's definition lives (library/stdlib)."""
@@ -468,9 +486,11 @@ class Tracer:
             return self.p.find_method(m, sym, "__init__"), None, (m, sym)
         return None, None, None
 
-    def build(self, fn: FuncInfo, depth: int = 0, stack: tuple[str, ...] = (), ctx=None) -> dict:
+    def build(self, fn: FuncInfo, depth: int = 0, stack: tuple[str, ...] = (), ctx=None,
+              lib_level: int = 0) -> dict:
         node = {"name": fn.qname, "file": str(fn.module.path), "line": fn.node.lineno,
-                "calls": [], "status": None}
+                "calls": [], "status": None, "lib": fn.lib}
+        lib_level = lib_level + 1 if fn.lib else 0
         if ctx and ctx[1] != fn.cls:
             node["as"] = ctx[1]                    # running as a subclass of the defining class
         if fn.qname in stack:
@@ -479,9 +499,12 @@ class Tracer:
         if self.max_depth is not None and depth >= self.max_depth:
             node["status"] = "depth-limit"
             return node
+        if lib_level > self.lib_depth:
+            node["status"] = "lib-depth-limit"
+            return node
         for c in self.calls(fn, ctx):
             if c.target is not None:
-                child = self.build(c.target, depth + 1, (*stack, fn.qname), c.ctx)
+                child = self.build(c.target, depth + 1, (*stack, fn.qname), c.ctx, lib_level)
                 child["call_line"], child["label"], child["override"] = c.line, c.label, c.override
                 node["calls"].append(child)
             elif self.external:
@@ -503,7 +526,10 @@ def render(node: dict, prefix: str = "", last: bool = True, top: bool = True) ->
             line = f"{node['name']}  :{node['call_line']}"
     if node.get("as"):
         line += f"  (as {node['as']})"
-    note = {"recursive": "  ↻ recursive", "depth-limit": "  … depth limit"}.get(node["status"], "")
+    if node.get("lib"):
+        line += f"  ⬡ library: {node['lib']}"
+    note = {"recursive": "  ↻ recursive", "depth-limit": "  … depth limit",
+            "lib-depth-limit": "  … library depth limit"}.get(node["status"], "")
     if node.get("override"):
         note = "  ◇ override" + note
     out = [prefix + branch + line + note]
@@ -518,7 +544,8 @@ def _walk(node: dict, ids: dict, edges: list, nodes: dict) -> str:
     key = ("ext:" + node["name"]) if node.get("external") else node["name"]
     if key not in ids:
         ids[key] = f"n{len(ids)}"
-        nodes[ids[key]] = (node["name"] if not node.get("external") else node["label"] + " [ext]")
+        nodes[ids[key]] = (("⬡ " if node.get("lib") else "") + node["name"]
+                           if not node.get("external") else node["label"] + " [ext]")
     me = ids[key]
     for k in node["calls"]:
         child = _walk(k, ids, edges, nodes)
@@ -592,6 +619,12 @@ def main() -> int:
     ap.add_argument("--format", choices=["tree", "json", "mermaid", "dot"], default="tree")
     ap.add_argument("-o", "--output", type=Path,
                     help="write to file instead of stdout; a .png path renders the Mermaid graph (needs Chrome)")
+    ap.add_argument("--libs", action="store_true",
+                    help="also follow calls into installed libraries (site-packages, stdlib), marked ⬡")
+    ap.add_argument("--lib-path", type=Path, action="append", default=[], metavar="DIR",
+                    help="extra directory (or conda/venv root) to search for libraries; repeatable")
+    ap.add_argument("--lib-depth", type=int, default=2,
+                    help="with --libs: levels to follow inside library code (default 2)")
     ap.add_argument("-i", "--interactive", action="store_true",
                     help="open the colourful interactive explorer (curses)")
     ap.add_argument("--json", action="store_true", help="alias for --format json")
@@ -628,8 +661,11 @@ def main() -> int:
         return 1
     if a.interactive:
         from tracer_tui import run
-        return run(Tracer(proj, None, True), fn, a.external)
-    tree = Tracer(proj, a.depth, a.external, a.all_calls).build(fn)
+        return run(Tracer(proj, None, True, lib_depth=a.lib_depth), fn, a.external, a.libs, a.lib_path)
+    if a.libs:
+        from tracer_docs import LibraryDocs
+        proj.libs = LibraryDocs(root, a.lib_path).projects
+    tree = Tracer(proj, a.depth, a.external, a.all_calls, a.lib_depth).build(fn)
     if a.format == "json":
         text = json.dumps(tree, indent=2)
     elif a.format == "tree":

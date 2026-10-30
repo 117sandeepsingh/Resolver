@@ -60,31 +60,67 @@ def docstring_of(node: ast.AST) -> str:
 
 def doc_for_project(fn: core.FuncInfo) -> Doc:
     node = fn.node
+    src = f"library source ({fn.lib})" if fn.lib else "project source"
     return Doc(fn.qname.split(":", 1)[1], signature_of(node), f"{fn.module.path}:{node.lineno}",
-               docstring_of(node) or "(this function has no docstring)", "project source")
+               docstring_of(node) or "(this function has no docstring)", src)
+
+
+# conda-style installs searched last, for packages the running interpreter / project venv can't see
+CONDA_ROOTS = [Path.home() / n for n in ("miniconda3", "anaconda3", "miniforge3", "mambaforge")]
 
 
 class LibraryDocs:
-    def __init__(self, project_root: Path):
-        self.projects = [core.Project(d) for d in self._search_dirs(project_root)]
+    def __init__(self, project_root: Path, extra_paths: list[Path] | tuple = ()):
+        self.interpreters = self._interpreters(extra_paths)
+        self.projects = [core.Project(d, lib=label) for d, label in self._search_dirs(project_root, extra_paths)]
         self.cache: dict[str, Doc] = {}
 
     @staticmethod
-    def _search_dirs(root: Path) -> list[Path]:
-        cands: list[Path] = []
+    def _site_dirs(root: Path) -> list[Path]:
+        """site-packages dirs of a venv / conda root (incl. its named envs)."""
+        out = sorted(root.glob("lib/python*/site-packages"))
+        out += sorted(root.glob("envs/*/lib/python*/site-packages"))
+        return out
+
+    @classmethod
+    def _search_dirs(cls, root: Path, extra: list[Path] | tuple = ()) -> list[tuple[Path, str]]:
+        """Priority order: project venv, running interpreter, stdlib, --lib-path, then conda fallbacks."""
+        cands: list[tuple[Path, str]] = []
         for name in (".venv", "venv"):
-            cands += sorted(Path(root, name, "lib").glob("python*/site-packages"))
+            cands += [(d, "site-packages") for d in cls._site_dirs(Path(root, name))]
         try:
-            cands += [Path(p) for p in site.getsitepackages()] + [Path(site.getusersitepackages())]
+            cands += [(Path(p), "site-packages") for p in site.getsitepackages()]
+            cands.append((Path(site.getusersitepackages()), "site-packages"))
         except Exception:
             pass
         paths = sysconfig.get_paths()
-        cands += [Path(paths[k]) for k in ("purelib", "platlib", "stdlib") if k in paths]
+        cands += [(Path(paths[k]), "site-packages") for k in ("purelib", "platlib") if k in paths]
+        if "stdlib" in paths:
+            cands.append((Path(paths["stdlib"]), "stdlib"))
+        for e in extra:
+            e = Path(e).expanduser()
+            found = cls._site_dirs(e)
+            cands += [(d, "site-packages") for d in found] if found else [(e, "site-packages")]
+        for c in CONDA_ROOTS:                       # fallbacks: packages not found anywhere above
+            cands += [(d, "site-packages") for d in cls._site_dirs(c)]
         seen, out = set(), []
-        for c in cands:
+        for c, label in cands:
             if c.is_dir() and (r := c.resolve()) not in seen:
                 seen.add(r)
-                out.append(r)
+                out.append((r, label))
+        return out
+
+    @staticmethod
+    def _interpreters(extra: list[Path] | tuple = ()) -> list[str]:
+        """Pythons for the import fallback: this one, then conda roots' and their envs'."""
+        cands = [Path(sys.executable)]
+        for root in [*map(Path, extra), *CONDA_ROOTS]:
+            cands += [root / "bin" / "python", *sorted(root.glob("envs/*/bin/python"))]
+        seen, out = set(), []
+        for c in cands:
+            if c.is_file() and (r := c.resolve()) not in seen:
+                seen.add(r)
+                out.append(str(c))
         return out
 
     def lookup(self, path: str) -> Doc:
@@ -166,21 +202,27 @@ print("::sig:" + sig); print("::file:" + where); print("::doc"); print(inspect.g
 '''
 
     def _imported(self, path: str) -> Doc:
-        try:
-            r = subprocess.run([sys.executable, "-I", "-c", self._PROBE, path],
-                               capture_output=True, text=True, timeout=15, cwd="/")
-            out = r.stdout.split("\n")
-        except (subprocess.TimeoutExpired, OSError):
-            out = ["::notfound"]
-        if not out or out[0].startswith("::notfound") or len(out) < 4 or not out[0].startswith("::sig:"):
+        out, used = ["::notfound"], sys.executable
+        for py in self.interpreters:                 # first interpreter that can import it wins
+            try:
+                r = subprocess.run([py, "-I", "-c", self._PROBE, path],
+                                   capture_output=True, text=True, timeout=15, cwd="/")
+                cand = r.stdout.split("\n")
+            except (subprocess.TimeoutExpired, OSError):
+                continue
+            if cand and cand[0].startswith("::sig:") and len(cand) >= 4:
+                out, used = cand, py
+                break
+        if not out[0].startswith("::sig:"):
             return Doc(path, text=f"No documentation found for {path}.\n\n"
-                                  "It was not found in the installed sources, and importing it failed.",
-                       source="not found", found=False)
+                                  "It was not found in the installed sources, and importing it failed in: "
+                                  + ", ".join(self.interpreters), source="not found", found=False)
         sig = out[0][6:]
         where = out[1][7:]
         text = "\n".join(out[3:]).strip() or "(no docstring)"
         name = path.rsplit(".", 1)[-1]
-        return Doc(path, f"{name}{sig}" if sig else "", where, text, "imported in a sandbox subprocess")
+        via = "" if used == sys.executable else f" with {used}"
+        return Doc(path, f"{name}{sig}" if sig else "", where, text, f"imported in a sandbox subprocess{via}")
 
 
 # ---- rendering: docstring -> styled, wrapped lines -------------------------------------------------

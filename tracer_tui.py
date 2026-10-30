@@ -32,10 +32,10 @@ PALETTE = {
     "const": (209, 1), "deco": (221, 3), "op": (246, 7), "gutter": (240, 4),
     "marker": (214, 3), "dim": (244, 4), "accent": (39, 6), "ok": (114, 2), "warn": (214, 3),
     "err": (203, 1), "title": (231, 7), "class": (80, 6), "fn": (114, 2), "dunder": (177, 5),
-    "line": (221, 3), "white": (231, 7),
+    "line": (221, 3), "white": (231, 7), "lib": (183, 5),
     # backgrounds
     "bg_header": (24, 4), "bg_footer": (236, 0), "bg_sel": (238, 4), "bg_sel_dim": (236, 0),
-    "bg_cursor": (237, 0), "bg_key": (31, 6), "bg_popup": (235, 0),
+    "bg_cursor": (237, 0), "bg_key": (31, 6), "bg_popup": (235, 0), "bg_lib": (54, 5),
 }
 
 
@@ -171,6 +171,16 @@ class Node:
         self.external, self.recursive, self.override = external, recursive, override
         self.expanded = False
         self.kids: list[Node] | None = None
+        # library code is marked everywhere; lib_level counts how deep inside library code we are
+        self.lib = fn.lib if fn is not None else None
+        self.lib_level = (parent.lib_level if parent and parent.lib else 0) + 1 if self.lib else 0
+
+    def key_path(self) -> tuple:
+        return tuple((n.call_line, n.label, n.fn.qname if n.fn else None) for n in self.chain())
+
+    @property
+    def lib_pkg(self) -> str:
+        return self.fn.module.name.split(".")[0] if self.lib else ""
 
     @property
     def name(self) -> str:
@@ -197,7 +207,18 @@ class CallTree:
         self.root = Node(root_fn)
         self.root.expanded = True
         self.show_external = False
+        self.follow_libs = False
         self._calls: dict[str, list] = {}
+
+    def set_libs(self, on: bool, libdocs) -> None:
+        """Turn "follow calls into installed libraries" on/off; the whole tree is rebuilt."""
+        self.follow_libs = on
+        self.tracer.p.libs = libdocs.projects if on else []
+        self.tracer.p._subs = None
+        self._calls.clear()
+        fresh = Node(self.root.fn)
+        fresh.expanded = True
+        self.root = fresh
 
     def calls_of(self, fn, ctx=None) -> list:
         key = (fn.qname, ctx[1] if ctx else None)
@@ -241,7 +262,7 @@ class CallTree:
             n, d = stack.pop()
             count += 1
             yield n
-            if d < max_depth:
+            if d < max_depth and n.lib_level < 1:       # search/expand never wander inside libraries
                 for k in reversed(self.visible_kids(n)):
                     stack.append((k, d + 1))
 
@@ -263,7 +284,9 @@ HELP = [
     ("d   K", "show docs: library docstring, or this project's docstring"),
     ("/   n N", "search by name; next / previous match"),
     ("[   ]", "history: back / forward through your jumps"),
-    ("x", "show / hide calls into libraries"), ("e", "open in $EDITOR at the cursor line"),
+    ("x", "show / hide calls into libraries (as unexpandable leaves)"),
+    ("L", "follow calls INTO library source (site-packages, stdlib) — marked ⬡ and purple"),
+    ("e", "open in $EDITOR at the cursor line"),
     ("mouse", "click select · double-click open/jump · wheel scroll · click breadcrumbs"),
     ("?", "this help"), ("q   Ctrl-C", "quit"),
 ]
@@ -292,6 +315,7 @@ class App:
         self.fwd: list[tuple[Node, int]] = []
         self.rects: dict[str, tuple[int, int, int, int]] = {}
         self.crumbs: list[tuple[int, int, Node]] = []
+        self.libdocs_dirs = ", ".join(str(p.root) for p in libdocs.projects[:1])
 
     # ---------- primitives
     def put(self, y: int, x: int, text: str, attr: int = 0, maxw: int | None = None) -> None:
@@ -319,8 +343,10 @@ class App:
         start = min([node.lineno] + [d.lineno for d in node.decorator_list])
         return start, node.end_lineno
 
-    def box(self, y: int, x: int, h: int, w: int, title: str, active: bool, right: str = "") -> None:
-        col = self.th.attr("accent", bold=True) if active else self.th.attr("gutter")
+    def box(self, y: int, x: int, h: int, w: int, title: str, active: bool, right: str = "",
+            lib: bool = False) -> None:
+        col = (self.th.attr("lib", bold=True) if lib else
+               self.th.attr("accent", bold=True) if active else self.th.attr("gutter"))
         self.put(y, x, "╭" + "─" * (w - 2) + "╮", col)
         for r in range(1, h - 1):
             self.put(y + r, x, "│", col)
@@ -355,8 +381,10 @@ class App:
         self.fill(0, 0, w, th.attr("title", bg))
         self.put(0, 1, " TRACER ", th.attr("white", "bg_key", bold=True))
         chain = self.sel.chain()
-        names = [n.name.split(".")[-1] if n.fn is None else n.name for n in chain]
-        budget = w - 12
+        names = [("⬡ " if n.lib else "") + (n.name.split(".")[-1] if n.fn is None else n.name) for n in chain]
+        if self.tree.follow_libs:
+            self.put(0, w - 9, " ⬡ LIBS ", th.attr("white", "bg_lib", bold=True))
+        budget = w - 22
         first = 0
         while len(" ▸ ".join(names[first:])) > budget and len(names) - first > 2:
             first += 1
@@ -367,7 +395,8 @@ class App:
             x += 4
         for i in range(first, len(names)):
             last = i == len(names) - 1
-            self.put(0, x, names[i], th.attr("white" if last else "text", bg, bold=last, ul=not last))
+            fg = "lib" if chain[i].lib else ("white" if last else "text")
+            self.put(0, x, names[i], th.attr(fg, bg, bold=last, ul=not last))
             self.crumbs.append((x, x + len(names[i]), chain[i]))
             x += len(names[i])
             if not last:
@@ -385,7 +414,7 @@ class App:
             left.append(("n N", "match"))
         if self.back or self.fwd:
             left.append(("[ ]", "history"))
-        left += [("x", "externals"), ("e", "editor")]
+        left += [("L", "libs " + ("on" if self.tree.follow_libs else "off")), ("x", "externals"), ("e", "editor")]
         return left
 
     def draw_footer(self, h: int, w: int) -> None:
@@ -425,13 +454,16 @@ class App:
             inner = [k for k in on_line if not k.external]
             ext = [k for k in on_line if k.external]
             if inner:
-                parts.append("calls → " + ", ".join(k.name + (" (override)" if k.override else "") for k in inner)
+                parts.append("calls → " + ", ".join(("⬡ " if k.lib else "") + k.name + (" (override)" if k.override else "")
+                                                     for k in inner)
                              + "   (Enter jumps)")
             if ext:
                 parts.append("library: " + ", ".join(k.label for k in ext) + "   (d for docs)")
-            return f"line {ln}" + (": " + "  ·  ".join(parts) if parts else "")
+            lib = f"⬡ library code ({self.sel.lib}) · " if self.sel.lib else ""
+            return f"{lib}line {ln}" + (": " + "  ·  ".join(parts) if parts else "")
         extra = "  ↻ recursive" if n.recursive else ("  ◇ subclass override" if n.override else "")
-        return (f"{n.module}  {n.fn.module.path}:{n.fn.node.lineno}  "
+        tag = f"⬡ LIBRARY ({n.lib}) · " if n.lib else ""
+        return (f"{tag}{n.module}  {n.fn.module.path}:{n.fn.node.lineno}  "
                 f"({len(self.tree.visible_kids(n))} calls){extra}")
 
     def draw_tree(self, y: int, x: int, h: int, w: int) -> None:
@@ -463,7 +495,9 @@ class App:
             elif n.recursive:
                 glyph, gst = "↻", "err"
             elif self.tree.visible_kids(n):
-                glyph, gst = ("▾" if n.expanded else "▸"), "accent"
+                glyph, gst = ("▾" if n.expanded else "▸"), ("lib" if n.lib else "accent")
+            elif n.lib:
+                glyph, gst = "⬡", "lib"
             elif n.override:
                 glyph, gst = "◇", "warn"
             else:
@@ -479,9 +513,9 @@ class App:
                 continue
             cls, _, meth = name.rpartition(".")
             if cls:
-                self.put(yy, col, cls + ".", th.attr("class", bg), room)
+                self.put(yy, col, cls + ".", th.attr("lib" if n.lib else "class", bg, dim=bool(n.lib)), room)
                 col += len(cls) + 1
-            style = "dunder" if meth.startswith("__") and meth.endswith("__") else "fn"
+            style = "lib" if n.lib else ("dunder" if meth.startswith("__") and meth.endswith("__") else "fn")
             self.put(yy, col, meth, th.attr(style, bg, bold=True), x + w - 1 - col)
             col += len(meth)
             if n.call_line is not None:
@@ -493,6 +527,9 @@ class App:
                 col += len(t)
             if n.override:
                 self.put(yy, col, " ◇ override", th.attr("warn", bg), x + w - 1 - col)
+                col += 11
+            if n.lib:
+                self.put(yy, col, f"  ⬡ {n.lib_pkg}", th.attr("lib", bg, dim=True), x + w - 1 - col)
         if len(rows) > inner:                           # scrollbar
             bar_h = max(1, inner * inner // len(rows))
             bar_y = (inner - bar_h) * self.tree_top // max(1, len(rows) - inner)
@@ -529,10 +566,18 @@ class App:
         start, end = self.fn_range(fn)
         total = end - start + 1
         self.cursor = max(0, min(self.cursor, total - 1))
-        self.box(y, x, h, w, f"{n.name}   {fn.module.path.name}:{start}-{end}", active,
-                 f"{self.cursor + 1}/{total}")
+        libmark = "⬡ " if n.lib else ""
+        self.box(y, x, h, w, f"{libmark}{n.name}   {fn.module.path.name}:{start}-{end}", active,
+                 f"{self.cursor + 1}/{total}", lib=bool(n.lib))
         hl = self.highlighter(fn.module.path)
         inner = h - 2
+        if n.lib:                                       # banner: this is NOT project code
+            ban = self.th.attr("white", "bg_lib", bold=True)
+            self.fill(y + 1, x + 1, w - 2, ban)
+            where = str(fn.module.path)
+            self.put(y + 1, x + 2, f"⬡ LIBRARY CODE · {n.lib} · {n.lib_pkg} — not part of your project (read-only)  {where}",
+                     ban, w - 4)
+            y, h, inner = y + 1, h - 1, inner - 1
         if self.cursor < self.code_top:
             self.code_top = self.cursor
         elif self.cursor >= self.code_top + inner:
@@ -626,10 +671,43 @@ class App:
                         else "no function is called on this line")
             return
         pick = tg[0] if len(tg) == 1 else self.choose(
-            "Jump to which call?", [k.name + ("   ◇ override" if k.override else "") for k in tg], tg)
+            "Jump to which call?",
+            [("⬡ " if k.lib else "") + k.name + ("   ◇ override" if k.override else "") for k in tg], tg)
         if pick is not None:
             self.sel.expanded = True
             self.jump(pick)
+
+    def toggle_libs(self) -> None:
+        """Follow calls into library source (or stop). The tree is rebuilt; what was expanded and
+        selected is restored wherever it still exists."""
+        expanded = {n.key_path() for n in self.all_loaded() if n.expanded}
+        sel_key = self.sel.key_path()
+        self.tree.set_libs(not self.tree.follow_libs, self.libdocs)
+        self.matches, self.back, self.fwd = [], [], []
+
+        def restore(n: Node) -> None:
+            if n.key_path() in expanded:
+                n.expanded = True
+                for k in self.tree.visible_kids(n):
+                    restore(k)
+        restore(self.tree.root)
+        node = self.tree.root
+        for part in sel_key[1:]:
+            nxt = next((k for k in self.tree.visible_kids(node) if k.key_path()[-1] == part), None)
+            if nxt is None:
+                break
+            node = nxt
+        self.select(node)
+        self.msg = ("following calls into libraries — they appear in purple with ⬡ (search: " + self.libdocs_dirs + " …)"
+                    if self.tree.follow_libs else "library following off — back to project code only")
+
+    def all_loaded(self):
+        stack = [self.tree.root]
+        while stack:
+            n = stack.pop()
+            yield n
+            if n.kids:
+                stack.extend(n.kids)
 
     def toggle_external(self) -> None:
         self.tree.show_external = not self.tree.show_external
@@ -724,6 +802,8 @@ class App:
         while stack and count < 3000:
             n = stack.pop()
             count += 1
+            if n.lib_level >= 1 and n is not self.sel:      # don't fan out inside library code
+                continue
             if self.tree.visible_kids(n):
                 n.expanded = True
                 stack.extend(self.tree.visible_kids(n))
@@ -781,7 +861,8 @@ class App:
             tg = [k for k in tg if not k.external or k.ext_path]
             if len(tg) > 1:
                 pick = self.choose("Docs for which call?",
-                                   [k.name if not k.external else f"{k.ext_path}   (library)" for k in tg], tg)
+                                   [(("⬡ " if k.lib else "") + k.name) if not k.external
+                                    else f"{k.ext_path}   (library)" for k in tg], tg)
                 if pick is not None:
                     self.show_docs(pick)
                 return
@@ -848,6 +929,8 @@ class App:
         if self.sel.fn is None:
             self.msg = "nothing to open: this is a call into a library"
             return
+        if self.sel.lib:
+            self.msg = "opening library source — changes would affect your installed package!"
         editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
         line = self.cursor_lineno() if self.focus == "code" else self.sel.fn.node.lineno
         curses.def_prog_mode()
@@ -923,6 +1006,8 @@ class App:
             self.history(1)
         elif ch == ord("x"):
             self.toggle_external()
+        elif ch == ord("L"):
+            self.toggle_libs()
         elif ch == ord("e"):
             self.open_editor()
         else:
@@ -1037,7 +1122,8 @@ class App:
                 self.key_code(ch)
 
 
-def run(tracer: core.Tracer, fn: core.FuncInfo, external: bool = False) -> int:
+def run(tracer: core.Tracer, fn: core.FuncInfo, external: bool = False, libs: bool = False,
+        lib_paths=()) -> int:
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         print("error: interactive mode needs a terminal", file=sys.stderr)
         return 2
@@ -1045,7 +1131,9 @@ def run(tracer: core.Tracer, fn: core.FuncInfo, external: bool = False) -> int:
     os.environ.setdefault("ESCDELAY", "25")
     tree = CallTree(tracer, fn)
     tree.show_external = external
-    libdocs = tdocs.LibraryDocs(tracer.p.root)
+    libdocs = tdocs.LibraryDocs(tracer.p.root, lib_paths)
+    if libs:
+        tree.set_libs(True, libdocs)
 
     def _main(scr) -> None:
         App(scr, tree, libdocs).run()
@@ -1062,6 +1150,9 @@ def main() -> int:
     ap.add_argument("function", nargs="?")
     ap.add_argument("--root", type=Path)
     ap.add_argument("--external", action="store_true", help="start with calls into libraries visible")
+    ap.add_argument("--libs", action="store_true", help="start with 'follow into library source' on (toggle: L)")
+    ap.add_argument("--lib-path", type=Path, action="append", default=[], metavar="DIR",
+                    help="extra directory / conda or venv root to search for libraries")
     a = ap.parse_args()
     if a.function is None:
         f, sep, name = str(a.file).rpartition(":")
@@ -1080,7 +1171,7 @@ def main() -> int:
     if fn is None:
         print(f"error: {a.function!r} not found (or ambiguous) in {a.file}", file=sys.stderr)
         return 1
-    return run(core.Tracer(proj, None, True), fn, a.external)
+    return run(core.Tracer(proj, None, True), fn, a.external, a.libs, a.lib_path)
 
 
 if __name__ == "__main__":
