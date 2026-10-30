@@ -162,7 +162,8 @@ class Highlighter:
 
 class Node:
     def __init__(self, fn, parent=None, call_line=None, label=None, external=False,
-                 recursive=False, override=False):
+                 recursive=False, override=False, ctx=None):
+        self.ctx = ctx          # exact class of `self` in this call, when known
         self.fn, self.parent, self.call_line, self.label = fn, parent, call_line, label
         self.external, self.recursive, self.override = external, recursive, override
         self.expanded = False
@@ -195,22 +196,24 @@ class CallTree:
         self.show_external = False
         self._calls: dict[str, list] = {}
 
-    def calls_of(self, fn) -> list:
-        if fn.qname not in self._calls:
-            self._calls[fn.qname] = self.tracer.calls(fn)
-        return self._calls[fn.qname]
+    def calls_of(self, fn, ctx=None) -> list:
+        key = (fn.qname, ctx[1] if ctx else None)
+        if key not in self._calls:
+            self._calls[key] = self.tracer.calls(fn, ctx)
+        return self._calls[key]
 
     def kids(self, n: Node) -> list[Node]:
         if n.kids is None:
             n.kids = []
             if n.fn is not None and not n.recursive:
                 seen = n.ancestors_q()
-                for c in self.calls_of(n.fn):
+                for c in self.calls_of(n.fn, n.ctx):
                     if c.target is None:
                         n.kids.append(Node(None, n, c.line, c.label, external=True))
                     else:
                         n.kids.append(Node(c.target, n, c.line, c.label,
-                                           recursive=c.target.qname in seen, override=c.override))
+                                           recursive=c.target.qname in seen, override=c.override,
+                                           ctx=c.ctx))
         return n.kids
 
     def visible_kids(self, n: Node) -> list[Node]:
@@ -435,6 +438,10 @@ class App:
             if n.call_line is not None:
                 self.put(yy, col, f" :{n.call_line}", th.attr("line", bg), x + w - 1 - col)
                 col += len(str(n.call_line)) + 2
+            if n.ctx and n.fn.cls != n.ctx[1]:
+                t = f" (as {n.ctx[1]})"
+                self.put(yy, col, t, th.attr("dim", bg), x + w - 1 - col)
+                col += len(t)
             if n.override:
                 self.put(yy, col, " ◇ override", th.attr("warn", bg), x + w - 1 - col)
         if len(rows) > inner:                           # scrollbar

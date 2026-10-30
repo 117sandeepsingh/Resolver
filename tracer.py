@@ -34,6 +34,7 @@ class Call:
     label: str
     target: "FuncInfo | None"
     override: bool = False      # a subclass override of the statically resolved method
+    ctx: "tuple | None" = None  # (Module, class name): exact class of `self` inside the callee, if known
 
 
 @dataclass
@@ -315,9 +316,13 @@ class Tracer:
                     types[n.target.id] = (d, False)
         return types
 
-    def calls(self, fn: FuncInfo) -> list[Call]:
-        """Source-ordered, de-duplicated calls in fn. Method calls whose receiver type is only
-        *declared* (self, annotations) also yield the subclass overrides as `override=True`."""
+    def calls(self, fn: FuncInfo, ctx=None) -> list[Call]:
+        """Source-ordered, de-duplicated calls in fn.
+
+        ctx is the concrete class `self` is known to be here (propagated from the entry point,
+        e.g. `x = Foo(); x.run()` makes `self` a Foo inside run), so `self.m()` resolves to
+        Foo's own override. Without it, method calls on a merely *declared* receiver type also
+        yield every subclass override as `override=True`."""
         types = self.local_types(fn)
         found = [n for n in ast.walk(fn.node) if isinstance(n, ast.Call)]
         found.sort(key=lambda c: (c.lineno, c.col_offset))
@@ -329,58 +334,62 @@ class Tracer:
                     label = f"….{c.func.attr}"      # e.g. foo().bar()
                 else:
                     continue
-            target, recv = self.resolve_call(fn, c.func, types)
+            target, recv, child_ctx = self.resolve_call(fn, c.func, types, ctx)
             key = target.qname if target else label
             if key in seen and not self.all_calls:
                 continue
             seen.add(key)
-            out.append(Call(c.lineno, label, target))
+            out.append(Call(c.lineno, label, target, ctx=child_ctx))
             if recv is not None and isinstance(c.func, ast.Attribute):
                 for f in self.p.overriders(recv[0], recv[1], c.func.attr):
                     if f.qname not in seen or self.all_calls:
                         seen.add(f.qname)
-                        out.append(Call(c.lineno, label, f, override=True))
+                        out.append(Call(c.lineno, label, f, override=True, ctx=(f.module, f.cls)))
         return out
 
-    def resolve_call(self, fn: FuncInfo, func: ast.expr, types: dict[str, tuple[str, bool]]):
-        """-> (target FuncInfo | None, receiver class (Module, name) | None).
-        The receiver is returned only when its type is declared rather than exact, i.e.
-        when a subclass override might be what actually runs."""
+    def resolve_call(self, fn: FuncInfo, func: ast.expr, types: dict[str, tuple[str, bool]], ctx=None):
+        """-> (target FuncInfo | None, receiver class | None, ctx for the callee).
+        receiver is returned only when its type is declared rather than exact, i.e. when a
+        subclass override might be what actually runs. ctx is the exact class of the callee's
+        `self` when that is known."""
         mod = fn.module
-        none = (None, None)
+        none = (None, None, None)
         if isinstance(func, ast.Name):
-            return self._by_symbol(mod, func.id), None
+            return self._by_symbol(mod, func.id)
         if not isinstance(func, ast.Attribute):
             return none
         meth, recv = func.attr, func.value
+        own = ctx or ((mod, fn.cls) if fn.cls else None)      # class whose MRO `self` uses
         # self.method() / cls.method()
-        if isinstance(recv, ast.Name) and recv.id in ("self", "cls") and fn.cls:
-            return self.p.find_method(mod, fn.cls, meth), (mod, fn.cls)
+        if isinstance(recv, ast.Name) and recv.id in ("self", "cls") and own:
+            t = self.p.find_method(own[0], own[1], meth)
+            return (t, None, ctx) if ctx else (t, own, None)
         # super().method()
         if (isinstance(recv, ast.Call) and isinstance(recv.func, ast.Name)
                 and recv.func.id == "super" and fn.cls):
             for b in mod.bases.get(fn.cls, []):
                 r = self.p.class_of(mod, dotted(b) or "")
                 if r and (m := self.p.find_method(r[0], r[1], meth)):
-                    return m, None
+                    return m, None, ctx
             return none
         # self.attr.method()   (attr type may come from a base class's __init__ annotation)
         if (isinstance(recv, ast.Attribute) and isinstance(recv.value, ast.Name)
-                and recv.value.id == "self" and fn.cls):
-            at = self.p.attr_type(mod, fn.cls, recv.attr)
+                and recv.value.id == "self" and own):
+            at = self.p.attr_type(own[0], own[1], recv.attr)
             if at and (d := dotted(at[1])):
                 return self._method_on(at[0], d, meth, exact=at[2])
             return none
         if isinstance(recv, ast.Name):
             m = self.p.resolve_module(mod, recv.id)          # imported module: mod.func()
             if m:
-                return self._by_symbol(m, meth), None
+                return self._by_symbol(m, meth)
             if recv.id in types:                              # typed variable
                 d, exact = types[recv.id]
-                t, r = self._method_on(mod, d, meth, exact=exact)
-                if t or r:
-                    return t, r
-            return self._method_on(mod, recv.id, meth, exact=True)   # Class.method()
+                res = self._method_on(mod, d, meth, exact=exact)
+                if res[0] or res[1]:
+                    return res
+            t, _, _ = self._method_on(mod, recv.id, meth, exact=True)   # Class.method()
+            return t, None, None
         d = dotted(recv)                                      # pkg.sub.func()
         if d:
             head, _, rest = d.partition(".")
@@ -388,38 +397,42 @@ class Tracer:
             if m:
                 m2 = self.p.load(f"{m.name}.{rest}") if rest else m
                 if m2:
-                    return self._by_symbol(m2, meth), None
+                    return self._by_symbol(m2, meth)
         return none
 
     def _method_on(self, mod: Module, class_expr: str, meth: str, exact: bool):
         r = self.p.class_of(mod, class_expr)
         if not r:
-            return None, None
-        return self.p.find_method(r[0], r[1], meth), (None if exact else r)
+            return None, None, None
+        t = self.p.find_method(r[0], r[1], meth)
+        return (t, None, r) if exact else (t, r, None)
 
-    def _by_symbol(self, mod: Module, name: str) -> FuncInfo | None:
+    def _by_symbol(self, mod: Module, name: str):
+        """-> (target, None, ctx): functions have no ctx; a constructor call makes ctx the class."""
         r = self.p.resolve_symbol(mod, name)
         if not r or not r[1]:
-            return None
+            return None, None, None
         m, sym = r
         if sym in m.funcs:
-            return m.funcs[sym]
+            return m.funcs[sym], None, None
         if sym in m.classes:                       # constructor call
-            return self.p.find_method(m, sym, "__init__")
-        return None
+            return self.p.find_method(m, sym, "__init__"), None, (m, sym)
+        return None, None, None
 
-    def build(self, fn: FuncInfo, depth: int = 0, stack: tuple[str, ...] = ()) -> dict:
+    def build(self, fn: FuncInfo, depth: int = 0, stack: tuple[str, ...] = (), ctx=None) -> dict:
         node = {"name": fn.qname, "file": str(fn.module.path), "line": fn.node.lineno,
                 "calls": [], "status": None}
+        if ctx and ctx[1] != fn.cls:
+            node["as"] = ctx[1]                    # running as a subclass of the defining class
         if fn.qname in stack:
             node["status"] = "recursive"
             return node
         if self.max_depth is not None and depth >= self.max_depth:
             node["status"] = "depth-limit"
             return node
-        for c in self.calls(fn):
+        for c in self.calls(fn, ctx):
             if c.target is not None:
-                child = self.build(c.target, depth + 1, (*stack, fn.qname))
+                child = self.build(c.target, depth + 1, (*stack, fn.qname), c.ctx)
                 child["call_line"], child["label"], child["override"] = c.line, c.label, c.override
                 node["calls"].append(child)
             elif self.external:
@@ -439,6 +452,8 @@ def render(node: dict, prefix: str = "", last: bool = True, top: bool = True) ->
             line = f"{node['label']}  [external]  :{node['call_line']}"
         else:
             line = f"{node['name']}  :{node['call_line']}"
+    if node.get("as"):
+        line += f"  (as {node['as']})"
     note = {"recursive": "  ↻ recursive", "depth-limit": "  … depth limit"}.get(node["status"], "")
     if node.get("override"):
         note = "  ◇ override" + note
