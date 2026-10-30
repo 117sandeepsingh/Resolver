@@ -23,6 +23,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+import builtins
+BUILTIN_NAMES = set(dir(builtins))
+
 # never resolve imports into (or scan) installed packages / virtualenvs
 SKIP_DIRS = {"site-packages", "dist-packages", ".venv", "venv", ".tox", ".git", "__pycache__",
              "node_modules", ".eggs"}
@@ -35,6 +38,7 @@ class Call:
     target: "FuncInfo | None"
     override: bool = False      # a subclass override of the statically resolved method
     ctx: "tuple | None" = None  # (Module, class name): exact class of `self` inside the callee, if known
+    ext_path: str | None = None  # for unresolved calls: best-guess importable path, e.g. "polars.scan_parquet"
 
 
 @dataclass
@@ -56,6 +60,7 @@ class Module:
     imports: dict[str, tuple[str, str | None]] = field(default_factory=dict)  # alias -> (module, symbol|None)
     # class -> self.attr -> (type expr, exact): exact=True when it came from `self.x = Cls()`
     attr_types: dict[str, dict[str, tuple[ast.expr, bool]]] = field(default_factory=dict)
+    star: list[str] = field(default_factory=list)             # modules pulled in by `from x import *`
 
 
 class Project:
@@ -184,7 +189,10 @@ class Project:
                     parts = parts[: len(parts) - (node.level - 1)]
                     target = ".".join(p for p in (*parts, target) if p)
                 for a in node.names:
-                    mod.imports[a.asname or a.name] = (target, a.name)
+                    if a.name == "*":
+                        mod.star.append(target)
+                    else:
+                        mod.imports[a.asname or a.name] = (target, a.name)
 
     @staticmethod
     def _self_attrs(cls: ast.ClassDef) -> dict[str, tuple[ast.expr, bool]]:
@@ -225,7 +233,12 @@ class Project:
         if name in mod.funcs or name in mod.classes:
             return mod, name
         imp = mod.imports.get(name)
-        if not imp or imp[1] is None:
+        if not imp:
+            for star in mod.star:                      # from x import *
+                if (m := self.load(star)) and (r := self.resolve_symbol(m, name, _seen)):
+                    return r
+            return None
+        if imp[1] is None:
             return None
         target, sym = imp
         m = self.load(target)
@@ -339,7 +352,8 @@ class Tracer:
             if key in seen and not self.all_calls:
                 continue
             seen.add(key)
-            out.append(Call(c.lineno, label, target, ctx=child_ctx))
+            ext = None if target else self.external_path(fn, c.func, types, ctx)
+            out.append(Call(c.lineno, label, target, ctx=child_ctx, ext_path=ext))
             if recv is not None and isinstance(c.func, ast.Attribute):
                 for f in self.p.overriders(recv[0], recv[1], c.func.attr):
                     if f.qname not in seen or self.all_calls:
@@ -400,6 +414,41 @@ class Tracer:
                     return self._by_symbol(m2, meth)
         return none
 
+    def import_path(self, mod: Module, name: str) -> str | None:
+        """Dotted name as written in `mod` -> importable path (`pl.col` -> `polars.col`).
+        Names that resolve into this project are not external, so they give None."""
+        head, _, rest = name.partition(".")
+        imp = mod.imports.get(head)
+        if imp:
+            base = imp[0] if imp[1] is None else f"{imp[0]}.{imp[1]}"
+            path = f"{base}.{rest}" if rest else base
+        elif head in BUILTIN_NAMES and not rest:
+            path = f"builtins.{head}"
+        else:
+            return None
+        return None if self.p.load(path.split(".")[0]) else path
+
+    def external_path(self, fn: FuncInfo, func: ast.expr, types, ctx=None) -> str | None:
+        """Best static guess of where an unresolved call's definition lives (library/stdlib)."""
+        mod = fn.module
+        if isinstance(func, ast.Name):
+            return self.import_path(mod, func.id)
+        if not isinstance(func, ast.Attribute):
+            return None
+        label, recv = dotted(func), func.value
+        own = ctx or ((mod, fn.cls) if fn.cls else None)
+        if (isinstance(recv, ast.Attribute) and isinstance(recv.value, ast.Name)
+                and recv.value.id == "self" and own):                  # self.attr.method()
+            at = self.p.attr_type(own[0], own[1], recv.attr)
+            if at and (d := dotted(at[1])) and (base := self.import_path(at[0], d)):
+                return f"{base}.{func.attr}"
+            return None
+        if isinstance(recv, ast.Name) and recv.id in types:            # typed variable
+            if base := self.import_path(mod, types[recv.id][0]):
+                return f"{base}.{func.attr}"
+            return None
+        return self.import_path(mod, label) if label else None         # module.func / pkg.sub.func
+
     def _method_on(self, mod: Module, class_expr: str, meth: str, exact: bool):
         r = self.p.class_of(mod, class_expr)
         if not r:
@@ -437,7 +486,7 @@ class Tracer:
                 node["calls"].append(child)
             elif self.external:
                 node["calls"].append({"name": c.label, "call_line": c.line, "label": c.label,
-                                      "external": True, "calls": [], "status": None})
+                                      "external": True, "path": c.ext_path, "calls": [], "status": None})
         return node
 
 

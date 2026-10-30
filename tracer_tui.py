@@ -2,7 +2,8 @@
 """Interactive, colourful terminal explorer for a traced call chain (curses, stdlib only).
 
 Left pane: lazily expanded call tree.  Right pane: syntax-highlighted source of the
-selected function.  Jump from a call site in the code straight into the callee.
+selected function.  Jump from a call site in the code straight into the callee, and press
+`d` for the docstring of any function (library docs are read from the installed sources).
 
     python3 tracer_tui.py FILE FUNCTION            (or FILE:FUNCTION)
     python3 tracer.py FILE:FUNCTION -i
@@ -22,6 +23,7 @@ import tokenize
 from pathlib import Path
 
 import tracer as core
+import tracer_docs as tdocs
 
 # ── palette: name -> (xterm-256 index, 8-colour fallback) ───────────────────────
 PALETTE = {
@@ -162,8 +164,9 @@ class Highlighter:
 
 class Node:
     def __init__(self, fn, parent=None, call_line=None, label=None, external=False,
-                 recursive=False, override=False, ctx=None):
+                 recursive=False, override=False, ctx=None, ext_path=None):
         self.ctx = ctx          # exact class of `self` in this call, when known
+        self.ext_path = ext_path    # external calls: importable path for docs lookup
         self.fn, self.parent, self.call_line, self.label = fn, parent, call_line, label
         self.external, self.recursive, self.override = external, recursive, override
         self.expanded = False
@@ -209,7 +212,7 @@ class CallTree:
                 seen = n.ancestors_q()
                 for c in self.calls_of(n.fn, n.ctx):
                     if c.target is None:
-                        n.kids.append(Node(None, n, c.line, c.label, external=True))
+                        n.kids.append(Node(None, n, c.line, c.label, external=True, ext_path=c.ext_path))
                     else:
                         n.kids.append(Node(c.target, n, c.line, c.label,
                                            recursive=c.target.qname in seen, override=c.override,
@@ -247,21 +250,32 @@ class CallTree:
 
 HELP = [
     ("Tree pane", ""),
-    ("↑ ↓ / j k", "move"), ("→ / l", "expand, or step into first child"), ("← / h", "collapse, or go to caller"),
-    ("Enter / Tab", "open code pane"), ("*  /  C", "expand all below / collapse all"),
-    ("/  n  N", "search function by name, next, previous"), ("x", "show/hide external calls"),
+    ("↑ ↓   j k", "move"), ("→  l", "open node; on an open node step into its first call"),
+    ("←  h", "close node; on a closed node go to its caller"), ("Enter  Tab", "open the code pane"),
+    ("Space", "expand / collapse"), ("*   C", "expand everything below / collapse all"),
+    ("PgUp PgDn  g G", "page / top / bottom"),
     ("", ""), ("Code pane", ""),
-    ("↑ ↓  PgUp PgDn", "move cursor / scroll"), ("← →", "scroll horizontally"),
-    ("Enter", "jump into the function called on this line"), ("u / Backspace", "go back up to the caller"),
-    ("e", "open in $EDITOR at this line"), ("Tab / Esc", "back to the tree"),
-    ("", ""), ("Anywhere", ""), ("mouse", "click to select, wheel to scroll"),
-    ("?", "this help"), ("q", "quit"),
+    ("↑ ↓   PgUp PgDn", "move the cursor"), ("Space  Ctrl-D/U", "page down / half pages"),
+    ("Enter", "jump into the function called on this line"), ("u  Backspace", "go up to the caller"),
+    ("← at left edge", "back to the tree (otherwise scrolls sideways)"), ("→  h l", "scroll sideways"),
+    ("Tab  Esc", "back to the tree"),
+    ("", ""), ("Everywhere", ""),
+    ("d   K", "show docs: library docstring, or this project's docstring"),
+    ("/   n N", "search by name; next / previous match"),
+    ("[   ]", "history: back / forward through your jumps"),
+    ("x", "show / hide calls into libraries"), ("e", "open in $EDITOR at the cursor line"),
+    ("mouse", "click select · double-click open/jump · wheel scroll · click breadcrumbs"),
+    ("?", "this help"), ("q   Ctrl-C", "quit"),
 ]
+HOME_KEYS = (curses.KEY_HOME, curses.KEY_FIND, ord("g"))
+END_KEYS = (curses.KEY_END, curses.KEY_SELECT, ord("G"))
+ENTER_KEYS = (10, 13, curses.KEY_ENTER)
+BACKSPACE_KEYS = (curses.KEY_BACKSPACE, 127, 8)
 
 
 class App:
-    def __init__(self, scr, tree: CallTree):
-        self.scr, self.tree = scr, tree
+    def __init__(self, scr, tree: CallTree, libdocs: tdocs.LibraryDocs):
+        self.scr, self.tree, self.libdocs = scr, tree, libdocs
         self.th = Theme()
         self.hl: dict[Path, Highlighter] = {}
         self.sel = tree.root
@@ -270,13 +284,16 @@ class App:
         self.cursor = 0          # code pane: index into the function's lines
         self.code_top = 0
         self.hscroll = 0
-        self.msg = ""
+        self.msg = "Tab switches pane  ·  d shows docs  ·  / searches  ·  ? for help"
         self.matches: list[Node] = []
         self.match_i = 0
         self.last_query = ""
+        self.back: list[tuple[Node, int]] = []
+        self.fwd: list[tuple[Node, int]] = []
         self.rects: dict[str, tuple[int, int, int, int]] = {}
+        self.crumbs: list[tuple[int, int, Node]] = []
 
-    # ---------- helpers
+    # ---------- primitives
     def put(self, y: int, x: int, text: str, attr: int = 0, maxw: int | None = None) -> None:
         h, w = self.scr.getmaxyx()
         if y < 0 or y >= h or x >= w or x < 0:
@@ -302,7 +319,7 @@ class App:
         start = min([node.lineno] + [d.lineno for d in node.decorator_list])
         return start, node.end_lineno
 
-    def box(self, y: int, x: int, h: int, w: int, title: str, active: bool) -> None:
+    def box(self, y: int, x: int, h: int, w: int, title: str, active: bool, right: str = "") -> None:
         col = self.th.attr("accent", bold=True) if active else self.th.attr("gutter")
         self.put(y, x, "╭" + "─" * (w - 2) + "╮", col)
         for r in range(1, h - 1):
@@ -310,8 +327,9 @@ class App:
             self.put(y + r, x + w - 1, "│", col)
         self.put(y + h - 1, x, "╰" + "─" * (w - 2) + "╯", col)
         if title:
-            t = f" {title} "
-            self.put(y, x + 2, t[: w - 4], self.th.attr("title" if active else "dim", bold=active))
+            self.put(y, x + 2, f" {title} "[: w - 4], self.th.attr("title" if active else "dim", bold=active))
+        if right and len(right) + 6 < w:
+            self.put(y + h - 1, x + w - len(right) - 4, f" {right} ", self.th.attr("dim"))
 
     # ---------- drawing
     def draw(self) -> None:
@@ -319,13 +337,12 @@ class App:
         scr.erase()
         h, w = scr.getmaxyx()
         if h < 8 or w < 40:
-            self.put(0, 0, "terminal too small", th.attr("err"))
+            self.put(0, 0, "terminal too small (need 40x8)", th.attr("err"))
             scr.refresh()
             return
         self.draw_header(w)
         top, bottom = 1, h - 2
-        lw = max(32, int(w * 0.38))
-        lw = min(lw, w - 30)
+        lw = min(max(32, int(w * 0.38)), w - 30)
         ph = bottom - top
         self.rects = {"tree": (top, 0, ph, lw), "code": (top, lw, ph, w - lw)}
         self.draw_tree(*self.rects["tree"])
@@ -334,38 +351,61 @@ class App:
         scr.refresh()
 
     def draw_header(self, w: int) -> None:
-        th = self.th
-        bg = "bg_header"
+        th, bg = self.th, "bg_header"
         self.fill(0, 0, w, th.attr("title", bg))
         self.put(0, 1, " TRACER ", th.attr("white", "bg_key", bold=True))
-        names = [n.name.split(".")[-1] if n.fn is None else n.name for n in self.sel.chain()]
+        chain = self.sel.chain()
+        names = [n.name.split(".")[-1] if n.fn is None else n.name for n in chain]
         budget = w - 12
-        crumbs = names
-        while len(" ▸ ".join(crumbs)) > budget and len(crumbs) > 2:
-            crumbs = crumbs[1:]
+        first = 0
+        while len(" ▸ ".join(names[first:])) > budget and len(names) - first > 2:
+            first += 1
         x = 11
-        if crumbs is not names:
+        self.crumbs = []
+        if first:
             self.put(0, x, "… ▸ ", th.attr("dim", bg))
             x += 4
-        for i, c in enumerate(crumbs):
-            last = i == len(crumbs) - 1
-            self.put(0, x, c, th.attr("white" if last else "text", bg, bold=last))
-            x += len(c)
+        for i in range(first, len(names)):
+            last = i == len(names) - 1
+            self.put(0, x, names[i], th.attr("white" if last else "text", bg, bold=last, ul=not last))
+            self.crumbs.append((x, x + len(names[i]), chain[i]))
+            x += len(names[i])
             if not last:
                 self.put(0, x, " ▸ ", th.attr("accent", bg))
                 x += 3
 
+    def hints(self) -> list[tuple[str, str]]:
+        n = self.sel
+        if self.focus == "tree":
+            left = [("↑↓", "move"), ("→", "open"), ("←", "close"), ("Enter", "code"), ("d", "docs"),
+                    ("/", "search")]
+        else:
+            left = [("↑↓", "cursor"), ("Enter", "jump in"), ("d", "docs"), ("u", "caller"), ("←", "tree")]
+        if self.matches:
+            left.append(("n N", "match"))
+        if self.back or self.fwd:
+            left.append(("[ ]", "history"))
+        left += [("x", "externals"), ("e", "editor")]
+        return left
+
     def draw_footer(self, h: int, w: int) -> None:
         th = self.th
         self.fill(h - 2, 0, w, th.attr("text", "bg_footer"))
-        self.put(h - 2, 1, self.status_text(), th.attr("warn" if self.msg else "text", "bg_footer"), w - 2)
+        warn = self.msg != "" and not self.msg.startswith("Tab switches")
+        self.put(h - 2, 1, self.status_text(), th.attr("warn" if warn else "text", "bg_footer"), w - 2)
         self.fill(h - 1, 0, w, th.attr("text", "bg_footer"))
-        keys = ([("↑↓", "move"), ("→", "expand"), ("←", "collapse"), ("Enter", "code"), ("/", "search"),
-                 ("x", "externals"), ("?", "help"), ("q", "quit")] if self.focus == "tree" else
-                [("↑↓", "cursor"), ("Enter", "jump into call"), ("u", "caller"), ("e", "editor"),
-                 ("Tab", "tree"), ("?", "help"), ("q", "quit")])
+        right = [("?", "help"), ("q", "quit")]
+        rw = sum(len(k) + len(d) + 5 for k, d in right)
         x = 1
-        for k, d in keys:
+        for k, d in self.hints():
+            need = len(k) + len(d) + 5
+            if x + need > w - rw - 1:
+                break
+            self.put(h - 1, x, f" {k} ", th.attr("white", "bg_key", bold=True))
+            self.put(h - 1, x + len(k) + 2, f" {d} ", th.attr("text", "bg_footer"))
+            x += need
+        x = w - rw
+        for k, d in right:
             self.put(h - 1, x, f" {k} ", th.attr("white", "bg_key", bold=True))
             self.put(h - 1, x + len(k) + 2, f" {d} ", th.attr("text", "bg_footer"))
             x += len(k) + len(d) + 5
@@ -375,23 +415,32 @@ class App:
             return self.msg
         n = self.sel
         if n.fn is None:
-            return f"external call: {n.label}"
+            if n.ext_path:
+                return f"call into a library: {n.ext_path}   — press d for its documentation"
+            return f"call into a library: {n.label}   — receiver type unknown, no docs available"
         if self.focus == "code":
-            tg = self.callees_on_line(self.cursor_lineno())
-            if tg:
-                return f"line {self.cursor_lineno()}: calls → " + ", ".join(
-                c.name + (" (override)" if c.override else "") for c in tg)
-            return f"line {self.cursor_lineno()}"
-        extra = "  ↻ recursive" if n.recursive else ("  ◇ subclass override of the called method" if n.override else "")
-        return f"{n.module}  {n.fn.module.path}:{n.fn.node.lineno}  ({len(self.tree.visible_kids(n))} calls){extra}"
+            ln = self.cursor_lineno()
+            on_line = self.nodes_on_line(ln, include_external=True)
+            parts = []
+            inner = [k for k in on_line if not k.external]
+            ext = [k for k in on_line if k.external]
+            if inner:
+                parts.append("calls → " + ", ".join(k.name + (" (override)" if k.override else "") for k in inner)
+                             + "   (Enter jumps)")
+            if ext:
+                parts.append("library: " + ", ".join(k.label for k in ext) + "   (d for docs)")
+            return f"line {ln}" + (": " + "  ·  ".join(parts) if parts else "")
+        extra = "  ↻ recursive" if n.recursive else ("  ◇ subclass override" if n.override else "")
+        return (f"{n.module}  {n.fn.module.path}:{n.fn.node.lineno}  "
+                f"({len(self.tree.visible_kids(n))} calls){extra}")
 
     def draw_tree(self, y: int, x: int, h: int, w: int) -> None:
         th = self.th
         active = self.focus == "tree"
-        self.box(y, x, h, w, "Call chain", active)
         rows = self.tree.flatten()
-        inner = h - 2
         idx = rows.index(self.sel) if self.sel in rows else 0
+        self.box(y, x, h, w, "Call chain", active, f"{idx + 1}/{len(rows)}")
+        inner = h - 2
         if idx < self.tree_top:
             self.tree_top = idx
         elif idx >= self.tree_top + inner:
@@ -413,10 +462,10 @@ class App:
                 glyph, gst = "·", "dim"
             elif n.recursive:
                 glyph, gst = "↻", "err"
-            elif n.override and not self.tree.visible_kids(n):
-                glyph, gst = "◇", "warn"
             elif self.tree.visible_kids(n):
                 glyph, gst = ("▾" if n.expanded else "▸"), "accent"
+            elif n.override:
+                glyph, gst = "◇", "warn"
             else:
                 glyph, gst = "•", "gutter"
             self.put(yy, col, glyph, th.attr(gst, bg, bold=True), x + w - 1 - col)
@@ -454,10 +503,11 @@ class App:
         start, end = self.fn_range(self.sel.fn)
         return min(start + self.cursor, end)
 
-    def callees_on_line(self, lineno: int) -> list[Node]:
+    def nodes_on_line(self, lineno: int, include_external: bool = False) -> list[Node]:
         if self.sel.fn is None:
             return []
-        return [k for k in self.tree.kids(self.sel) if not k.external and k.call_line == lineno]
+        return [k for k in self.tree.kids(self.sel)
+                if k.call_line == lineno and (include_external or not k.external)]
 
     def draw_code(self, y: int, x: int, h: int, w: int) -> None:
         th = self.th
@@ -465,13 +515,22 @@ class App:
         n = self.sel
         if n.fn is None:
             self.box(y, x, h, w, n.label, active)
-            self.put(y + 2, x + 3, "External / unresolved call — no source in this project.", th.attr("dim"))
+            self.put(y + 2, x + 3, "A call into a library — there is no project source to show.", th.attr("dim"))
+            if n.ext_path:
+                self.put(y + 4, x + 3, n.ext_path, th.attr("call", bold=True), w - 6)
+                self.put(y + 6, x + 3, "Press ", th.attr("text"))
+                self.put(y + 6, x + 9, " d ", th.attr("white", "bg_key", bold=True))
+                self.put(y + 6, x + 12, " to read its documentation.", th.attr("text"))
+            else:
+                self.put(y + 4, x + 3, "The receiver's type isn't known statically, so no documentation lookup is possible.",
+                         th.attr("dim"), w - 6)
             return
         fn = n.fn
         start, end = self.fn_range(fn)
         total = end - start + 1
         self.cursor = max(0, min(self.cursor, total - 1))
-        self.box(y, x, h, w, f"{n.name}   {fn.module.path.name}:{start}-{end}", active)
+        self.box(y, x, h, w, f"{n.name}   {fn.module.path.name}:{start}-{end}", active,
+                 f"{self.cursor + 1}/{total}")
         hl = self.highlighter(fn.module.path)
         inner = h - 2
         if self.cursor < self.code_top:
@@ -479,8 +538,9 @@ class App:
         elif self.cursor >= self.code_top + inner:
             self.code_top = self.cursor - inner + 1
         self.code_top = max(0, min(self.code_top, max(0, total - inner)))
-        call_lines = {k.call_line for k in self.tree.kids(n) if not k.external}
-        ext_lines = {k.call_line for k in self.tree.kids(n) if k.external}
+        kids = self.tree.kids(n)
+        call_lines = {k.call_line for k in kids if not k.external}
+        ext_lines = {k.call_line for k in kids if k.external and k.ext_path}
         nw = len(str(end))
         gutter = nw + 3
         for r in range(inner):
@@ -526,6 +586,22 @@ class App:
         for a in node.chain()[:-1]:
             a.expanded = True
 
+    def jump(self, node: Node, cursor: int = 0) -> None:
+        """A deliberate jump: remember where we were so [ and ] can retrace it."""
+        if node is not self.sel:
+            self.back.append((self.sel, self.cursor))
+            self.fwd.clear()
+        self.select(node, cursor)
+
+    def history(self, direction: int) -> None:
+        src, dst = (self.back, self.fwd) if direction < 0 else (self.fwd, self.back)
+        if not src:
+            self.msg = "nothing " + ("behind" if direction < 0 else "ahead") + " in the jump history"
+            return
+        dst.append((self.sel, self.cursor))
+        node, cur = src.pop()
+        self.select(node, cur)
+
     def move(self, delta: int) -> None:
         rows = self.tree.flatten()
         i = rows.index(self.sel) if self.sel in rows else 0
@@ -536,29 +612,38 @@ class App:
     def go_up(self) -> None:
         n = self.sel
         if n.parent:
-            self.select(n.parent, cursor=max(0, (n.call_line or 0) - self.fn_range(n.parent.fn)[0]))
+            self.jump(n.parent, cursor=max(0, (n.call_line or 0) - self.fn_range(n.parent.fn)[0]))
         else:
-            self.msg = "already at the root"
+            self.msg = "already at the root of the chain"
 
     def jump_into(self) -> None:
         if self.sel.fn is None:
             return
-        tg = self.callees_on_line(self.cursor_lineno())
+        tg = self.nodes_on_line(self.cursor_lineno())
         if not tg:
-            self.msg = "no project function is called on this line"
+            ext = self.nodes_on_line(self.cursor_lineno(), include_external=True)
+            self.msg = ("this line only calls into libraries — press d for their docs" if ext
+                        else "no function is called on this line")
             return
         pick = tg[0] if len(tg) == 1 else self.choose(
             "Jump to which call?", [k.name + ("   ◇ override" if k.override else "") for k in tg], tg)
         if pick is not None:
             self.sel.expanded = True
-            self.select(pick)
+            self.jump(pick)
 
+    def toggle_external(self) -> None:
+        self.tree.show_external = not self.tree.show_external
+        if not self.tree.show_external and self.sel.external:
+            self.select(self.sel.parent)
+        self.msg = "calls into libraries " + ("shown" if self.tree.show_external else "hidden")
+
+    # ---------- popups & prompts
     def choose(self, title: str, labels: list[str], items: list):
         i = 0
         while True:
             self.draw()
             h, w = self.scr.getmaxyx()
-            bw = min(w - 4, max(len(title), *(len(l) for l in labels)) + 6)
+            bw = min(w - 4, max(len(title), *(len(l) for l in labels)) + 8)
             bh = len(labels) + 2
             by, bx = (h - bh) // 2, (w - bw) // 2
             for r in range(bh):
@@ -567,14 +652,18 @@ class App:
             for k, l in enumerate(labels):
                 a = self.th.attr("white", "bg_sel", bold=True) if k == i else self.th.attr("text", "bg_popup")
                 self.fill(by + 1 + k, bx + 1, bw - 2, a)
-                self.put(by + 1 + k, bx + 2, l, a, bw - 4)
+                self.put(by + 1 + k, bx + 2, f"{k + 1} " if k < 9 else "  ", self.th.attr("marker", None, bold=True)
+                         if k != i else a)
+                self.put(by + 1 + k, bx + 4, l, a, bw - 6)
             self.scr.refresh()
             ch = self.scr.getch()
             if ch in (curses.KEY_UP, ord("k")):
                 i = (i - 1) % len(labels)
-            elif ch in (curses.KEY_DOWN, ord("j")):
+            elif ch in (curses.KEY_DOWN, ord("j"), 9):
                 i = (i + 1) % len(labels)
-            elif ch in (10, 13, curses.KEY_ENTER):
+            elif ord("1") <= ch <= ord("9") and ch - ord("1") < len(labels):
+                return items[ch - ord("1")]
+            elif ch in ENTER_KEYS:
                 return items[i]
             elif ch in (27, ord("q")):
                 return None
@@ -585,24 +674,29 @@ class App:
         try:
             while True:
                 h, w = self.scr.getmaxyx()
-                self.fill(h - 2, 0, w, self.th.attr("white", "bg_key", bold=True))
-                self.put(h - 2, 1, f"{label}{buf}", self.th.attr("white", "bg_key", bold=True), w - 2)
+                a = self.th.attr("white", "bg_key", bold=True)
+                self.fill(h - 2, 0, w, a)
+                self.put(h - 2, 1, f"{label}{buf}", a, w - 2)
+                hint = "Enter go · Esc cancel · Ctrl-U clear"
+                self.put(h - 2, max(len(label) + len(buf) + 4, w - len(hint) - 2), hint, self.th.attr("text", "bg_key"))
                 self.scr.move(h - 2, min(w - 1, 1 + len(label) + len(buf)))
                 self.scr.refresh()
                 ch = self.scr.getch()
-                if ch in (10, 13, curses.KEY_ENTER):
+                if ch in ENTER_KEYS:
                     return buf
                 if ch == 27:
                     return None
-                if ch in (curses.KEY_BACKSPACE, 127, 8):
+                if ch in BACKSPACE_KEYS:
                     buf = buf[:-1]
+                elif ch == 21:
+                    buf = ""
                 elif 32 <= ch < 127:
                     buf += chr(ch)
         finally:
             curses.curs_set(0)
 
     def search(self) -> None:
-        q = self.prompt("/")
+        q = self.prompt("/ ")
         if not q:
             return
         self.last_query = q.lower()
@@ -615,8 +709,8 @@ class App:
         self.goto_match()
 
     def goto_match(self) -> None:
-        self.select(self.matches[self.match_i])
-        self.msg = f"match {self.match_i + 1}/{len(self.matches)} for '{self.last_query}'"
+        self.jump(self.matches[self.match_i])
+        self.msg = f"match {self.match_i + 1}/{len(self.matches)} for '{self.last_query}'  (n / N for next / previous)"
 
     def next_match(self, step: int) -> None:
         if not self.matches:
@@ -626,8 +720,7 @@ class App:
         self.goto_match()
 
     def expand_all(self) -> None:
-        stack = [self.sel]
-        count = 0
+        stack, count = [self.sel], 0
         while stack and count < 3000:
             n = stack.pop()
             count += 1
@@ -635,30 +728,132 @@ class App:
                 n.expanded = True
                 stack.extend(self.tree.visible_kids(n))
 
-    def help(self) -> None:
+    def popup_frame(self, title: str, right: str = "") -> tuple[int, int, int, int]:
         h, w = self.scr.getmaxyx()
-        bw, bh = min(w - 2, 74), min(h - 2, len(HELP) + 4)
-        by, bx = (h - bh) // 2, (w - bw) // 2
+        bw, bh = min(w - 4, 100), h - 6
+        by, bx = 2, (w - bw) // 2
         for r in range(bh):
             self.fill(by + r, bx, bw, self.th.attr("text", "bg_popup"))
-        self.box(by, bx, bh, bw, "Help — any key closes", True)
-        for k, (a, b) in enumerate(HELP[: bh - 3]):
-            if not b:
-                self.put(by + 1 + k, bx + 2, a, self.th.attr("accent", "bg_popup", bold=True))
+        self.box(by, bx, bh, bw, title, True, right)
+        return by, bx, bh, bw
+
+    def help(self) -> None:
+        top = 0
+        while True:
+            self.draw()
+            by, bx, bh, bw = self.popup_frame("Help — ↑↓ scroll, any other key closes")
+            inner = bh - 2
+            top = max(0, min(top, max(0, len(HELP) - inner)))
+            for k, (a, b) in enumerate(HELP[top: top + inner]):
+                if not b:
+                    self.put(by + 1 + k, bx + 2, a, self.th.attr("accent", "bg_popup", bold=True))
+                else:
+                    self.put(by + 1 + k, bx + 3, a, self.th.attr("marker", "bg_popup", bold=True), 20)
+                    self.put(by + 1 + k, bx + 24, b, self.th.attr("text", "bg_popup"), bw - 26)
+            self.scr.refresh()
+            ch = self.scr.getch()
+            if ch in (curses.KEY_DOWN, ord("j")):
+                top += 1
+            elif ch in (curses.KEY_UP, ord("k")):
+                top -= 1
+            elif ch in (curses.KEY_RESIZE, curses.KEY_MOUSE):
+                continue
             else:
-                self.put(by + 1 + k, bx + 3, a, self.th.attr("marker", "bg_popup", bold=True), 20)
-                self.put(by + 1 + k, bx + 24, b, self.th.attr("text", "bg_popup"), bw - 26)
-        self.scr.refresh()
-        self.scr.getch()
+                return
+
+    # ---------- documentation
+    def show_docs(self, node: Node) -> None:
+        if node.fn is not None:
+            doc = tdocs.doc_for_project(node.fn)
+        elif node.ext_path:
+            self.msg = f"looking up {node.ext_path} …"
+            self.draw()
+            doc = self.libdocs.lookup(node.ext_path)
+            self.msg = ""
+        else:
+            self.msg = "no documentation target: the receiver's type isn't known statically"
+            return
+        self.pager(doc)
+
+    def docs_key(self) -> None:
+        if self.focus == "code" and self.sel.fn is not None:
+            tg = self.nodes_on_line(self.cursor_lineno(), include_external=True)
+            tg = [k for k in tg if not k.external or k.ext_path]
+            if len(tg) > 1:
+                pick = self.choose("Docs for which call?",
+                                   [k.name if not k.external else f"{k.ext_path}   (library)" for k in tg], tg)
+                if pick is not None:
+                    self.show_docs(pick)
+                return
+            if tg:
+                self.show_docs(tg[0])
+                return
+            # no call on this line: document the function being read
+        self.show_docs(self.sel)
+
+    def pager(self, doc: tdocs.Doc) -> None:
+        top = 0
+        while True:
+            self.draw()
+            by, bx, bh, bw = self.popup_frame(f"Docs · {doc.title}"[: 90])
+            lines = tdocs.format_doc(doc, bw - 6)
+            inner = bh - 3
+            top = max(0, min(top, max(0, len(lines) - inner)))
+            for r, segs in enumerate(lines[top: top + inner]):
+                x = bx + 3
+                for text, st in segs:
+                    self.put(by + 1 + r, x, text, self.th.attr(st, "bg_popup", bold=st in ("fn", "kw")), bx + bw - 3 - x)
+                    x += len(text)
+            hint = f" ↑↓ PgUp PgDn scroll · g G ends · q Esc close   {top + 1}-{min(len(lines), top + inner)}/{len(lines)} "
+            self.put(by + bh - 2, bx + 2, hint, self.th.attr("dim", "bg_popup"), bw - 4)
+            if len(lines) > inner:
+                bar_h = max(1, inner * inner // len(lines))
+                bar_y = (inner - bar_h) * top // max(1, len(lines) - inner)
+                for r in range(bar_h):
+                    self.put(by + 1 + bar_y + r, bx + bw - 1, "┃", self.th.attr("accent", "bg_popup"))
+            self.scr.refresh()
+            ch = self.scr.getch()
+            page = max(1, inner - 1)
+            if ch in (curses.KEY_DOWN, ord("j")):
+                top += 1
+            elif ch in (curses.KEY_UP, ord("k")):
+                top -= 1
+            elif ch in (curses.KEY_NPAGE, ord(" "), 6):
+                top += page
+            elif ch in (curses.KEY_PPAGE, ord("b"), 2):
+                top -= page
+            elif ch == 4:
+                top += page // 2
+            elif ch == 21:
+                top -= page // 2
+            elif ch in HOME_KEYS:
+                top = 0
+            elif ch in END_KEYS:
+                top = 10**6
+            elif ch == curses.KEY_MOUSE:
+                try:
+                    bstate = curses.getmouse()[4]
+                except curses.error:
+                    continue
+                if bstate & getattr(curses, "BUTTON4_PRESSED", 0):
+                    top -= 3
+                elif bstate & getattr(curses, "BUTTON5_PRESSED", 0):
+                    top += 3
+            elif ch == curses.KEY_RESIZE:
+                continue
+            elif ch in (27, ord("q"), ord("d"), ord("K")) or ch in ENTER_KEYS:
+                return
 
     def open_editor(self) -> None:
         if self.sel.fn is None:
+            self.msg = "nothing to open: this is a call into a library"
             return
         editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+        line = self.cursor_lineno() if self.focus == "code" else self.sel.fn.node.lineno
         curses.def_prog_mode()
         curses.endwin()
         try:
-            subprocess.run([*editor.split(), f"+{self.cursor_lineno()}", str(self.sel.fn.module.path)])
+            subprocess.run([*editor.split(), f"+{line}", str(self.sel.fn.module.path)])
         except OSError as e:
             self.msg = f"cannot launch editor: {e}"
         curses.reset_prog_mode()
@@ -667,62 +862,108 @@ class App:
     # ---------- input
     def handle_mouse(self) -> None:
         try:
-            _, mx, my, _, bstate = curses.getmouse()
+            _, mx, my, _, b = curses.getmouse()
         except curses.error:
             return
-        wheel_up = bstate & getattr(curses, "BUTTON4_PRESSED", 0)
-        wheel_dn = bstate & getattr(curses, "BUTTON5_PRESSED", 0)
+        up = b & getattr(curses, "BUTTON4_PRESSED", 0)
+        down = b & getattr(curses, "BUTTON5_PRESSED", 0)
+        press = b & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED)
+        double = b & curses.BUTTON1_DOUBLE_CLICKED
+        if my == 0 and (press or double):                      # breadcrumb: jump to that ancestor
+            for x0, x1, node in self.crumbs:
+                if x0 <= mx < x1:
+                    self.jump(node)
+            return
         for name, (ry, rx, rh, rw) in self.rects.items():
             if not (ry <= my < ry + rh and rx <= mx < rx + rw):
                 continue
+            inside = ry + 1 <= my <= ry + rh - 2 and rx + 1 <= mx <= rx + rw - 2   # not on the border
             if name == "tree":
-                if wheel_up or wheel_dn:
-                    self.move(-3 if wheel_up else 3)
-                elif bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED):
+                if up or down:
+                    self.move(-3 if up else 3)
+                elif (press or double) and inside:
                     rows = self.tree.flatten()
                     i = self.tree_top + my - ry - 1
                     if 0 <= i < len(rows):
                         self.focus = "tree"
-                        self.select(rows[i])
+                        node = rows[i]
+                        glyph_x = rx + 1 + (len(node.chain()) - 1) * 2
+                        if node is not self.sel:
+                            self.select(node)
+                        if double:
+                            if node.fn is not None:
+                                self.focus = "code"
+                            else:
+                                self.show_docs(node)
+                        elif glyph_x <= mx <= glyph_x + 1 and self.tree.visible_kids(node):
+                            node.expanded = not node.expanded
             elif self.sel.fn is not None:
-                if wheel_up or wheel_dn:
-                    self.cursor += -3 if wheel_up else 3
-                elif bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED):
+                if up or down:
+                    self.cursor += -3 if up else 3
+                elif (press or double) and inside:
                     self.focus = "code"
                     self.cursor = self.code_top + my - ry - 1
+                    if double:
+                        self.jump_into()
+            return
 
-    def key_tree(self, ch: int) -> bool:
+    def key_common(self, ch: int) -> bool:
+        """Keys that mean the same in both panes."""
+        if ch in (ord("d"), ord("K")):
+            self.docs_key()
+        elif ch == ord("/"):
+            self.search()
+        elif ch == ord("n"):
+            self.next_match(1)
+        elif ch == ord("N"):
+            self.next_match(-1)
+        elif ch == ord("["):
+            self.history(-1)
+        elif ch == ord("]"):
+            self.history(1)
+        elif ch == ord("x"):
+            self.toggle_external()
+        elif ch == ord("e"):
+            self.open_editor()
+        else:
+            return False
+        return True
+
+    def key_tree(self, ch: int) -> None:
         n = self.sel
+        kids = self.tree.visible_kids(n)
+        page = max(1, self.rects["tree"][2] - 3) if self.rects else 10
         if ch in (curses.KEY_UP, ord("k")):
             self.move(-1)
         elif ch in (curses.KEY_DOWN, ord("j")):
             self.move(1)
         elif ch == curses.KEY_PPAGE:
-            self.move(-10)
+            self.move(-page)
         elif ch == curses.KEY_NPAGE:
-            self.move(10)
-        elif ch in (curses.KEY_HOME, ord("g")):
+            self.move(page)
+        elif ch in HOME_KEYS:
             self.move(-10**6)
-        elif ch in (curses.KEY_END, ord("G")):
+        elif ch in END_KEYS:
             self.move(10**6)
         elif ch in (curses.KEY_RIGHT, ord("l")):
-            if self.tree.visible_kids(n) and not n.expanded:
+            if kids and not n.expanded:
                 n.expanded = True
-            elif self.tree.visible_kids(n):
-                self.select(self.tree.visible_kids(n)[0])
-            else:
+            elif kids:
+                self.select(kids[0])
+            elif n.fn is not None:
                 self.focus = "code"
         elif ch in (curses.KEY_LEFT, ord("h")):
-            if n.expanded and n.parent is not None and self.tree.visible_kids(n):
+            if n.expanded and kids:
                 n.expanded = False
             elif n.parent is not None:
                 self.select(n.parent)
-            elif n.expanded:
-                n.expanded = False
-        elif ch in (10, 13, curses.KEY_ENTER, 9) and n.fn is not None:
-            self.focus = "code"
+        elif ch in ENTER_KEYS or ch == 9:
+            if n.fn is not None:
+                self.focus = "code"
+            else:
+                self.show_docs(n)
         elif ch == ord(" "):
-            if self.tree.visible_kids(n):
+            if kids:
                 n.expanded = not n.expanded
         elif ch == ord("*"):
             self.expand_all()
@@ -731,53 +972,44 @@ class App:
                 k.expanded = False
             self.tree.root.expanded = True
             self.select(self.tree.root)
-        elif ch == ord("/"):
-            self.search()
-        elif ch == ord("n"):
-            self.next_match(1)
-        elif ch == ord("N"):
-            self.next_match(-1)
-        elif ch == ord("x"):
-            self.tree.show_external = not self.tree.show_external
-            self.msg = "external calls " + ("shown" if self.tree.show_external else "hidden")
+        elif ch == 27:
+            self.matches, self.msg = [], ""
         else:
-            return False
-        return True
+            self.key_common(ch)
 
-    def key_code(self, ch: int) -> bool:
+    def key_code(self, ch: int) -> None:
+        page = max(1, self.rects["code"][2] - 3) if self.rects else 10
         if ch in (curses.KEY_UP, ord("k")):
             self.cursor -= 1
         elif ch in (curses.KEY_DOWN, ord("j")):
             self.cursor += 1
         elif ch == curses.KEY_PPAGE:
-            self.cursor -= 15
-        elif ch == curses.KEY_NPAGE:
-            self.cursor += 15
-        elif ch in (curses.KEY_HOME, ord("g")):
+            self.cursor -= page
+        elif ch in (curses.KEY_NPAGE, ord(" ")):
+            self.cursor += page
+        elif ch == 4:
+            self.cursor += page // 2
+        elif ch == 21:
+            self.cursor -= page // 2
+        elif ch in HOME_KEYS:
             self.cursor = 0
-        elif ch in (curses.KEY_END, ord("G")):
+        elif ch in END_KEYS:
             self.cursor = 10**6
         elif ch in (curses.KEY_RIGHT, ord("l")):
             self.hscroll += 8
         elif ch in (curses.KEY_LEFT, ord("h")):
-            self.hscroll = max(0, self.hscroll - 8)
-        elif ch in (10, 13, curses.KEY_ENTER):
+            if self.hscroll:
+                self.hscroll = max(0, self.hscroll - 8)
+            else:
+                self.focus = "tree"
+        elif ch in ENTER_KEYS:
             self.jump_into()
-        elif ch in (ord("u"), curses.KEY_BACKSPACE, 127, 8):
+        elif ch in (ord("u"), *BACKSPACE_KEYS):
             self.go_up()
-        elif ch == ord("e"):
-            self.open_editor()
         elif ch in (9, 27):
             self.focus = "tree"
-        elif ch == ord("/"):
-            self.search()
-        elif ch == ord("n"):
-            self.next_match(1)
-        elif ch == ord("N"):
-            self.next_match(-1)
         else:
-            return False
-        return True
+            self.key_common(ch)
 
     def run(self) -> None:
         curses.curs_set(0)
@@ -789,7 +1021,8 @@ class App:
         while True:
             self.draw()
             ch = self.scr.getch()
-            self.msg = ""
+            if ch != curses.KEY_RESIZE:
+                self.msg = ""
             if ch in (ord("q"), ord("Q")):
                 return
             if ch == curses.KEY_RESIZE:
@@ -812,10 +1045,14 @@ def run(tracer: core.Tracer, fn: core.FuncInfo, external: bool = False) -> int:
     os.environ.setdefault("ESCDELAY", "25")
     tree = CallTree(tracer, fn)
     tree.show_external = external
+    libdocs = tdocs.LibraryDocs(tracer.p.root)
 
     def _main(scr) -> None:
-        App(scr, tree).run()
-    curses.wrapper(_main)
+        App(scr, tree, libdocs).run()
+    try:
+        curses.wrapper(_main)
+    except KeyboardInterrupt:
+        pass
     return 0
 
 
@@ -824,7 +1061,7 @@ def main() -> int:
     ap.add_argument("file", type=Path)
     ap.add_argument("function", nargs="?")
     ap.add_argument("--root", type=Path)
-    ap.add_argument("--external", action="store_true", help="start with external calls visible")
+    ap.add_argument("--external", action="store_true", help="start with calls into libraries visible")
     a = ap.parse_args()
     if a.function is None:
         f, sep, name = str(a.file).rpartition(":")
