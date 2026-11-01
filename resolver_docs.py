@@ -1,4 +1,4 @@
-"""Documentation lookup for functions the tracer can't follow (libraries, stdlib, builtins).
+"""Documentation lookup for functions the resolver can't follow (libraries, stdlib, builtins).
 
 Strategy, in order:
   1. static   - find the module's source in the interpreter / venv search dirs and read the
@@ -19,7 +19,7 @@ import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 
-import tracer as core
+import resolver as core
 
 
 @dataclass

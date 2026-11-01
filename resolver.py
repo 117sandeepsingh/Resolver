@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""tracer: print the chain of functions called from a given Python function.
+"""resolver: print the chain of functions called from a given Python function.
 
-usage: tracer.py FILE FUNCTION | FILE:FUNCTION [-i] [--root DIR] [--depth N] [--external]
+usage: resolver.py FILE FUNCTION | FILE:FUNCTION [-i] [--root DIR] [--depth N] [--external]
                  [--all-calls] [--format tree|json|mermaid|dot]
 
 FUNCTION is `name` or `Class.method`. Calls are resolved statically (ast) to
@@ -32,7 +32,7 @@ SKIP_DIRS = {"site-packages", "dist-packages", ".venv", "venv", ".tox", ".git", 
 
 
 if __name__ == "__main__":
-    sys.modules.setdefault("tracer", sys.modules[__name__])
+    sys.modules.setdefault("resolver", sys.modules[__name__])
 
 
 @dataclass
@@ -319,7 +319,7 @@ def dotted(node: ast.AST) -> str | None:
     return None
 
 
-class Tracer:
+class Resolver:
     def __init__(self, project: Project, max_depth: int | None, external: bool, all_calls: bool = False,
                  lib_depth: int = 2):
         self.p = project
@@ -660,12 +660,12 @@ def main() -> int:
               file=sys.stderr)
         return 1
     if a.interactive:
-        from tracer_tui import run
-        return run(Tracer(proj, None, True, lib_depth=a.lib_depth), fn, a.external, a.libs, a.lib_path)
+        from resolver_tui import run
+        return run(Resolver(proj, None, True, lib_depth=a.lib_depth), fn, a.external, a.libs, a.lib_path)
     if a.libs:
-        from tracer_docs import LibraryDocs
+        from resolver_docs import LibraryDocs
         proj.libs = LibraryDocs(root, a.lib_path).projects
-    tree = Tracer(proj, a.depth, a.external, a.all_calls, a.lib_depth).build(fn)
+    tree = Resolver(proj, a.depth, a.external, a.all_calls, a.lib_depth).build(fn)
     if a.format == "json":
         text = json.dumps(tree, indent=2)
     elif a.format == "tree":

@@ -1,4 +1,4 @@
-# tracer.py and tracer_tui.py use only the Python standard library (3.10+, incl. curses);
+# resolver.py and resolver_tui.py use only the Python standard library (3.10+, incl. curses);
 # nothing to pip install.
 # Optional, only for `-o something.png` rendering:
 #   - Chrome/Chromium on PATH (system package, not pip)

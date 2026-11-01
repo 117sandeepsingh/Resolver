@@ -5,8 +5,8 @@ Left pane: lazily expanded call tree.  Right pane: syntax-highlighted source of 
 selected function.  Jump from a call site in the code straight into the callee, and press
 `d` for the docstring of any function (library docs are read from the installed sources).
 
-    python3 tracer_tui.py FILE FUNCTION            (or FILE:FUNCTION)
-    python3 tracer.py FILE:FUNCTION -i
+    python3 resolver_tui.py FILE FUNCTION            (or FILE:FUNCTION)
+    python3 resolver.py FILE:FUNCTION -i
 """
 from __future__ import annotations
 
@@ -22,8 +22,8 @@ import sys
 import tokenize
 from pathlib import Path
 
-import tracer as core
-import tracer_docs as tdocs
+import resolver as core
+import resolver_docs as tdocs
 
 # ── palette: name -> (xterm-256 index, 8-colour fallback) ───────────────────────
 PALETTE = {
@@ -202,8 +202,8 @@ class Node:
 
 
 class CallTree:
-    def __init__(self, tracer: core.Tracer, root_fn: core.FuncInfo):
-        self.tracer = tracer
+    def __init__(self, resolver: core.Resolver, root_fn: core.FuncInfo):
+        self.resolver = resolver
         self.root = Node(root_fn)
         self.root.expanded = True
         self.show_external = False
@@ -213,8 +213,8 @@ class CallTree:
     def set_libs(self, on: bool, libdocs) -> None:
         """Turn "follow calls into installed libraries" on/off; the whole tree is rebuilt."""
         self.follow_libs = on
-        self.tracer.p.libs = libdocs.projects if on else []
-        self.tracer.p._subs = None
+        self.resolver.p.libs = libdocs.projects if on else []
+        self.resolver.p._subs = None
         self._calls.clear()
         fresh = Node(self.root.fn)
         fresh.expanded = True
@@ -223,7 +223,7 @@ class CallTree:
     def calls_of(self, fn, ctx=None) -> list:
         key = (fn.qname, ctx[1] if ctx else None)
         if key not in self._calls:
-            self._calls[key] = self.tracer.calls(fn, ctx)
+            self._calls[key] = self.resolver.calls(fn, ctx)
         return self._calls[key]
 
     def kids(self, n: Node) -> list[Node]:
@@ -379,16 +379,16 @@ class App:
     def draw_header(self, w: int) -> None:
         th, bg = self.th, "bg_header"
         self.fill(0, 0, w, th.attr("title", bg))
-        self.put(0, 1, " TRACER ", th.attr("white", "bg_key", bold=True))
+        self.put(0, 1, " RESOLVER ", th.attr("white", "bg_key", bold=True))
         chain = self.sel.chain()
         names = [("⬡ " if n.lib else "") + (n.name.split(".")[-1] if n.fn is None else n.name) for n in chain]
         if self.tree.follow_libs:
             self.put(0, w - 9, " ⬡ LIBS ", th.attr("white", "bg_lib", bold=True))
-        budget = w - 22
+        budget = w - 24
         first = 0
         while len(" ▸ ".join(names[first:])) > budget and len(names) - first > 2:
             first += 1
-        x = 11
+        x = 13
         self.crumbs = []
         if first:
             self.put(0, x, "… ▸ ", th.attr("dim", bg))
@@ -1122,16 +1122,16 @@ class App:
                 self.key_code(ch)
 
 
-def run(tracer: core.Tracer, fn: core.FuncInfo, external: bool = False, libs: bool = False,
+def run(resolver: core.Resolver, fn: core.FuncInfo, external: bool = False, libs: bool = False,
         lib_paths=()) -> int:
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         print("error: interactive mode needs a terminal", file=sys.stderr)
         return 2
     locale.setlocale(locale.LC_ALL, "")
     os.environ.setdefault("ESCDELAY", "25")
-    tree = CallTree(tracer, fn)
+    tree = CallTree(resolver, fn)
     tree.show_external = external
-    libdocs = tdocs.LibraryDocs(tracer.p.root, lib_paths)
+    libdocs = tdocs.LibraryDocs(resolver.p.root, lib_paths)
     if libs:
         tree.set_libs(True, libdocs)
 
@@ -1171,7 +1171,7 @@ def main() -> int:
     if fn is None:
         print(f"error: {a.function!r} not found (or ambiguous) in {a.file}", file=sys.stderr)
         return 1
-    return run(core.Tracer(proj, None, True), fn, a.external, a.libs, a.lib_path)
+    return run(core.Resolver(proj, None, True), fn, a.external, a.libs, a.lib_path)
 
 
 if __name__ == "__main__":
